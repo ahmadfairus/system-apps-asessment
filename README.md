@@ -1,6 +1,6 @@
-# Panduan: assess.sh v4.0 + Trivy di Kali
+# Panduan: assess.sh v4.1 + Trivy di Kali
 
-Alur: server (offline) → salin manual → Kali (ada internet) → kirim hasil ke analis.
+Alur: server (offline) → salin manual → Kali (ada internet) → unggah dua file hasil ke chat Claude.
 
 ## A. Siapkan Kali — sekali saja
 
@@ -23,11 +23,29 @@ echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc
 trivy --version        # harus 0.76.2
 ```
 
+Verifikasi tanda tangan (disarankan, butuh `cosign`):
+
+```bash
+curl -fLO https://github.com/aquasecurity/trivy/releases/download/v$V/trivy_${V}_Linux-64bit.tar.gz.sigstore.json
+cosign verify-blob trivy_${V}_Linux-64bit.tar.gz \
+  --bundle trivy_${V}_Linux-64bit.tar.gz.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/aquasecurity/trivy/\.github/workflows/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# harus tertulis: Verified OK
+```
+
 Aturan versi:
 
 - Pakai v0.70 ke atas. **Jangan** pakai 0.69.4, 0.69.5, 0.69.6 (versi berbahaya dari insiden Maret 2026).
+- Checksum dan tanda tangan hanya membuktikan file sama dengan yang dirilis. Keduanya **tidak** melindungi dari rilis resmi yang disusupi. Karena itu jangan langsung memakai rilis yang baru keluar; tunggu minimal 7 hari dan pastikan tidak ada pengumuman insiden di GitHub `aquasecurity/trivy`.
 - Unduh hanya dari GitHub Releases `aquasecurity/trivy`. Jangan dari Docker Hub, `apt`, atau skrip `curl | sh`.
 - Jangan pernah memasang Trivy di server produksi/UAT.
+
+Salin juga `kali_scan.sh` ke `~/trivy/` lalu:
+
+```bash
+chmod +x ~/trivy/kali_scan.sh
+```
 
 ## B. Unduh database — ulangi sebelum tiap sesi pemindaian
 
@@ -43,10 +61,10 @@ ls ~/.cache/trivy/db/trivy.db ~/.cache/trivy/java-db/trivy-java.db   # keduanya 
 sudo bash assess.sh
 ```
 
-Tidak perlu parameter. Di akhir tercetak dua baris; catat keduanya:
+Tidak perlu parameter. Docker rootless (daemon milik user aplikasi, mis. `application`) dikenali otomatis. Di akhir tercetak dua baris; catat keduanya:
 
 ```
-RESULT: /root/assess-<host>-<waktu>.tar.gz
+RESULT: /tmp/assess-<host>-<waktu>.tar.gz
 SHA256: <64 karakter>
 ```
 
@@ -55,15 +73,18 @@ Opsi yang berguna:
 | Opsi | Kegunaan |
 |---|---|
 | `--anonymize --anon-key <kata-rahasia>` | Samarkan hostname/IP. Pakai kata rahasia yang sama di semua server. |
+| `--docker-user <user>` | Jalankan perintah Docker sebagai user ini (mis. `application`), bila deteksi otomatis gagal. |
+| `--docker-host <uri>` | Alamat daemon, mis. `unix:///run/user/1001/docker.sock`. |
 | `--no-exec` | Jangan `docker exec`; paket container dibaca dari filesystem saja. |
-| `--safe` | Beban paling ringan (lewati pengecekan berat). |
-| `-o <folder>` | Lokasi arsip hasil. |
+| `--safe` | Beban paling ringan: tanpa scan izin file, tanpa request jaringan lokal, tanpa `docker exec`. |
+| `-o <folder>` | Lokasi arsip hasil (default `/tmp`). |
 
 Salin **satu file** `.tar.gz` itu ke Kali.
 
 ## D. Di Kali — pindai
 
 ```bash
+cd ~/trivy
 ./kali_scan.sh assess-<host>-<waktu>.tar.gz <SHA256-dari-langkah-C>
 ```
 
@@ -74,9 +95,11 @@ trivy sbom   --skip-db-update --skip-java-db-update --offline-scan sbom/<file>.c
 trivy config --skip-check-update config/
 ```
 
-## E. Kirim ke analis
+## E. Unggah ke chat Claude
 
-Dua file teks:
+Sebelum mengunggah, buka `assess-<host>-<waktu>.txt`, cari bagian `===== FILE: raw/processes.txt =====`, dan hapus password yang mungkin tertulis di argumen proses (mis. `-Ddb.password=...`).
+
+Unggah dua file teks ini ke chat:
 
 1. `assess-<host>-<waktu>.txt`
 2. `assess-<host>-<waktu>-trivy.txt`
@@ -85,17 +108,20 @@ Dua file teks:
 
 | File | Isi |
 |---|---|
-| `<nama>.txt` | Laporan lengkap: temuan, aplikasi berjalan, inventaris library, paket OS, indikasi kompromi |
+| `<nama>.txt` | Laporan lengkap: temuan, aplikasi berjalan, inventaris library, paket OS, akses Docker, indikasi kompromi |
 | `sbom/host.cdx.json` | Paket OS host + semua library (Java, Node.js, Python, PHP) di host |
 | `sbom/container-<nama>.cdx.json` | Paket OS + library tiap container yang berjalan |
+| `sbom/RINGKASAN.txt` | Jumlah paket/library per SBOM, termasuk yang tidak bisa dicocokkan Trivy |
 | `config/NNN/…` | Salinan Dockerfile/Compose, nilai secret sudah diganti `REDACTED` |
 | `config/INDEX.txt` | Nomor folder → path asli di server |
+| `BACA-SAYA.txt` | Penjelasan singkat isi arsip |
 | `SHA256SUMS` | Sidik jari tiap file di dalam arsip |
 
 ## Batasan yang perlu diketahui
 
-- Library Java tanpa `groupId` (versi hanya terbaca dari nama file) tidak bisa dicocokkan Trivy. Jumlahnya tertulis di `sbom/RINGKASAN.txt`; library ini dinilai analis dari `.txt`.
+- Library Java tanpa `groupId` (versi hanya terbaca dari nama file) tidak bisa dicocokkan Trivy. Jumlahnya tertulis di `sbom/RINGKASAN.txt`; library ini dinilai dari `.txt`.
 - Trivy tidak memeriksa Docker Compose. Compose diperiksa oleh `assess.sh` sendiri (temuan `CMP-*`).
 - Image yang tersimpan tetapi tidak berjalan hanya didaftar (`CNT-IDLE-01`), isinya tidak dipindai.
+- Bila perintah Docker tidak bisa dipakai sama sekali, container dibaca dari file di disk (`DKR-FSONLY-01`); image dan riwayat build tidak diperiksa.
 - Biner Go/native hanya ditandai (`APP-UNK-01`), library di dalamnya tidak terbaca.
 - Kubernetes belum dicakup.
