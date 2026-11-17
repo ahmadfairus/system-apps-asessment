@@ -28,6 +28,10 @@
 #   --lib-rules FILE      aturan library TAMBAHAN (CVE baru), ditambahkan ke bawaan
 #   --no-exec             jangan jalankan docker exec; paket OS container dibaca
 #                         dari sisi host saja (otomatis aktif pada --safe)
+#   --docker-user USER    jalankan perintah docker (hanya-baca) sebagai USER,
+#                         mis. Docker rootless atau root diblokir. Tanpa opsi ini
+#                         user pemilik daemon/socket dicari otomatis.
+#   --docker-host URI     alamat daemon, mis. unix:///run/user/1001/docker.sock
 #   --lib-baseline FILE   baseline versi library yang DISETUJUI tim; library di
 #                         bawah baseline ditandai "drift" (menyesuaikan patching)
 #   -o DIR                folder output (default /tmp)
@@ -43,7 +47,7 @@
 set -u
 umask 077
 
-SCRIPT_VERSION="4.0"
+SCRIPT_VERSION="4.1"
 OUTBASE="/tmp"
 SKIP_FS=0
 NO_NET=0
@@ -61,6 +65,8 @@ JAVA_HOMES=""    # JDK manual
 LIB_RULES=""
 LIB_BASELINE=""
 NO_EXEC=0
+DOCKER_USER=""
+DOCKER_HOST_OPT=""
 
 usage() { awk 'NR>2 && /^#====/{exit} NR>2' "$0" | sed 's/^# \{0,1\}//'; }
 need_arg() { [ -n "${2:-}" ] || { echo "Opsi $1 butuh nilai" >&2; exit 1; }; }
@@ -80,6 +86,8 @@ while [ $# -gt 0 ]; do
     --lib-rules)         need_arg "$1" "${2:-}"; LIB_RULES="$2"; shift 2 ;;
     --lib-baseline)      need_arg "$1" "${2:-}"; LIB_BASELINE="$2"; shift 2 ;;
     --no-exec)           NO_EXEC=1; shift ;;
+    --docker-user)       need_arg "$1" "${2:-}"; DOCKER_USER="$2"; shift 2 ;;
+    --docker-host)       need_arg "$1" "${2:-}"; DOCKER_HOST_OPT="$2"; shift 2 ;;
     -o)                  need_arg "$1" "${2:-}"; OUTBASE="$2"; shift 2 ;;
     --mysql-cnf)         need_arg "$1" "${2:-}"; MYSQL_CNF="$2"; shift 2 ;;
     -h|--help)           usage; exit 0 ;;
@@ -1932,25 +1940,21 @@ check_tomcat() {
 # CONTAINER (Docker / Podman): postur keamanan + inventaris library di image
 #------------------------------------------------------------------------------
 check_containers() {
-  local CRT="" grp sock tcp md name dir jarn n depth
-  if command -v docker >/dev/null 2>&1 && (pgrep -x dockerd >/dev/null 2>&1 || docker info >/dev/null 2>&1); then CRT=docker
-  elif command -v podman >/dev/null 2>&1 && pgrep -x conmon >/dev/null 2>&1; then CRT=podman
-  elif command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then CRT=docker
-  else return 0; fi
-  log "Cek container ($CRT)"
+  local CRT="$CRT_BIN" grp sock tcp md name dir jarn n depth
+  [ -n "$CRT_SRC" ] || return 0
+  log "Cek container ($CRT, dibaca: $CRT_SRC, sebagai: $CRT_AS)"
   ROLES="$ROLES $CRT"
 
   # --- Dump info (read-only) ---
-  { echo "### $CRT version"; $CRT version 2>&1
-    echo; echo "### ps -a"; $CRT ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>&1
-    echo; echo "### images"; $CRT images --digests --format '{{.Repository}}:{{.Tag}}\t{{.Digest}}\t{{.CreatedSince}}\t{{.Size}}' 2>&1
-    echo; echo "### info (ringkas)"; $CRT info 2>/dev/null | grep -iE 'Server Version|Storage Driver|Cgroup|Rootless|Security Options|seccomp|apparmor|selinux|userns' ; } > "$RAW/container_${CRT}.txt" 2>&1
+  if [ "$CRT_SRC" = cli ]; then
+    { echo "### $CRT version (sebagai: $CRT_AS)"; "${CRT_CMD[@]}" version 2>&1
+      echo; echo "### ps -a"; "${CRT_CMD[@]}" ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>&1
+      echo; echo "### images"; "${CRT_CMD[@]}" images --digests --format '{{.Repository}}:{{.Tag}}\t{{.Digest}}\t{{.CreatedSince}}\t{{.Size}}' 2>&1
+      echo; echo "### info (ringkas)"; "${CRT_CMD[@]}" info 2>/dev/null | grep -iE 'Server Version|Storage Driver|Cgroup|Rootless|Security Options|seccomp|apparmor|selinux|userns' ; } > "$RAW/container_${CRT}.txt" 2>&1
 
+  fi
   # --- Daemon / host-level ---
-  # grup docker = setara root
-  grp=$(getent group docker 2>/dev/null | cut -d: -f4)
-  [ -n "$grp" ] && finding HIGH CNT-GROUP-01 Container "Anggota grup 'docker' (setara akses root ke host)" "$grp" \
-    "Batasi keanggotaan grup docker seminimal mungkin; setiap anggota bisa menjalankan container privileged = root. Pertimbangkan rootless Docker/Podman."
+  # akses grup/socket/sudo ke daemon: lihat check_docker_access (DKR-*)
   # socket TCP tanpa TLS
   tcp=$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -E ':(2375|2376)$' | tr '\n' ' ')
   echo "$tcp" | grep -q 2375 && finding CRITICAL CNT-TCP-01 Container "Docker API diekspos via TCP 2375 tanpa TLS (kendali penuh daemon)" "$tcp" \
@@ -1958,7 +1962,7 @@ check_containers() {
   echo "$tcp" | grep -q 2376 && finding MEDIUM CNT-TCP-02 Container "Docker API diekspos via TCP 2376" "$tcp" \
     "Pastikan 2376 memakai TLS mutual (--tlsverify) dan hanya dari IP admin via firewall."
   # permission socket
-  for sock in /var/run/docker.sock /run/docker.sock /run/podman/podman.sock; do
+  for sock in /var/run/docker.sock /run/docker.sock /run/podman/podman.sock /run/user/*/docker.sock; do
     [ -S "$sock" ] || continue
     n=$(stat -c '%a' "$sock" 2>/dev/null)
     echo "$sock $n $(stat -c '%U:%G' "$sock" 2>/dev/null)" >> "$RAW/container_${CRT}.txt"
@@ -1968,14 +1972,15 @@ check_containers() {
 
   # --- Per-container: inspect -> parser Python ---
   local running insp="$OUT/.cinsp.$$" det="$RAW/container_detail.txt" merged="$OUT/.cmerged.$$"
-  running=$($CRT ps -q 2>/dev/null)
+  running=$(cut -f1 "$OUT/.cmap" 2>/dev/null | tr '\n' ' ')
   if [ -z "$running" ]; then
     finding INFO CNT-NONE-01 Container "$CRT berjalan tetapi tidak ada container aktif" "-" "Tetap cek image tersimpan dengan Trivy (lihat raw/container_${CRT}.txt)."
   elif [ -z "$PY" ]; then
     finding INFO CNT-NOPY-01 Container "Postur container dilewati (python tidak tersedia)" "-" "Jalankan 'docker inspect' manual atau pasang python."
   else
-    $CRT inspect $running > "$insp" 2>/dev/null
-    "$PY" - "$insp" "$CRT" "$merged" "$det" <<'PYEOF' | while IFS=$'\t' read -r sev id title ev rec; do
+    if [ "$CRT_SRC" = cli ]; then "${CRT_CMD[@]}" inspect $running > "$insp" 2>/dev/null
+    else cp "$OUT/.cinsp_fs.json" "$insp" 2>/dev/null; fi
+    "$PY" - "$insp" "$CRT" "$merged" "$det" "${DKR_MODE:-}" <<'PYEOF' | while IFS=$'\t' read -r sev id title ev rec; do
 from __future__ import print_function
 import sys, json, io
 try:
@@ -1988,6 +1993,8 @@ SENS_MOUNT = ('/', '/etc', '/root', '/home', '/var/run/docker.sock', '/run/docke
               '/var/run', '/proc', '/sys', '/boot', '/dev', '/usr', '/var/lib')
 DANGER_CAP = set(['ALL','SYS_ADMIN','SYS_PTRACE','SYS_MODULE','NET_ADMIN','DAC_READ_SEARCH','SYS_RAWIO','BPF','DAC_OVERRIDE','NET_RAW'])
 def out(sev, cid, title, ev, rec): print('\t'.join([sev, cid, title, ev, rec]))
+MODE = sys.argv[5] if len(sys.argv) > 5 else ''
+RL = 'rootless' in MODE and 'rootful' not in MODE
 if isinstance(data, dict): data = [data]
 for c in data:
     name = (c.get('Name') or c.get('Id', '?')[:12]).lstrip('/')
@@ -1995,8 +2002,12 @@ for c in data:
     image = cfg.get('Image', '?'); state = (c.get('State') or {}).get('Running'); user = (cfg.get('User') or '').strip()
     det.write('== %s  image=%s  running=%s  user=%s\n' % (name, image, state, user or 'root(default)'))
     if hc.get('Privileged'):
-        out('CRITICAL','CNT-PRIV-01','Container privileged (akses penuh ke host)','%s (image %s)' % (name, image),
-            'Hapus --privileged. Beri hanya capability yang dibutuhkan dan --security-opt no-new-privileges.')
+        if RL:
+            out('HIGH','CNT-PRIV-01','Container privileged (rootless: akses penuh ke semua milik user pemilik daemon, bukan root host)','%s (image %s)' % (name, image),
+                'Hapus --privileged. Beri hanya capability yang dibutuhkan dan --security-opt no-new-privileges.')
+        else:
+            out('CRITICAL','CNT-PRIV-01','Container privileged (akses penuh ke host)','%s (image %s)' % (name, image),
+                'Hapus --privileged. Beri hanya capability yang dibutuhkan dan --security-opt no-new-privileges.')
     binds = hc.get('Binds') or []; mounts = c.get('Mounts') or []
     msrc = set()
     for b in binds: msrc.add(b.split(':')[0])
@@ -2004,12 +2015,16 @@ for c in data:
         if m.get('Source'): msrc.add(m['Source'])
     for s in msrc:
         if s.rstrip('/').endswith('docker.sock'):
-            out('CRITICAL','CNT-SOCK-01','Docker socket di-mount ke dalam container (setara root di host)','%s: %s' % (name, s),
-                'Jangan mount docker.sock ke container aplikasi. Bila perlu Docker API, pakai proxy ber-otorisasi read-only.')
+            if RL:
+                out('HIGH','CNT-SOCK-01','Docker socket di-mount ke dalam container (rootless: kendali semua container user pemilik daemon)','%s: %s' % (name, s),
+                    'Jangan mount docker.sock ke container aplikasi. Bila perlu Docker API, pakai proxy ber-otorisasi read-only.')
+            else:
+                out('CRITICAL','CNT-SOCK-01','Docker socket di-mount ke dalam container (setara root di host)','%s: %s' % (name, s),
+                    'Jangan mount docker.sock ke container aplikasi. Bila perlu Docker API, pakai proxy ber-otorisasi read-only.')
     for s in msrc:
         sn = s.rstrip('/') or '/'
         if sn in SENS_MOUNT and not sn.endswith('docker.sock'):
-            out('HIGH','CNT-MOUNT-01','Path host sensitif di-mount ke container','%s: %s' % (name, sn),
+            out('MEDIUM' if RL else 'HIGH','CNT-MOUNT-01','Path host sensitif di-mount ke container' + (' (rootless: terbatas pada yang bisa dibaca user pemilik daemon)' if RL else ''),'%s: %s' % (name, sn),
                 'Mount hanya folder data yang diperlukan, read-only (:ro). Hindari /, /etc, /root, /var/run.')
     for key, val, cid in (('PidMode','pid','CNT-NS-PID'),('NetworkMode','net','CNT-NS-NET'),('IpcMode','ipc','CNT-NS-IPC')):
         if (hc.get(key) or '') == 'host':
@@ -2029,7 +2044,7 @@ for c in data:
     if not any('no-new-privileges' in x.lower() for x in so):
         out('LOW','CNT-NNP-01','Container tanpa no-new-privileges', name, 'Tambah --security-opt no-new-privileges.')
     if user in ('','0','root','0:0'):
-        out('MEDIUM','CNT-USER-01','Proses dalam container berjalan sebagai root','%s (User=%s)' % (name, user or 'tidak diset'),
+        out('LOW' if RL else 'MEDIUM','CNT-USER-01','Proses dalam container berjalan sebagai root' + (' (rootless: root container = user pemilik daemon di host)' if RL else ''),'%s (User=%s)' % (name, user or 'tidak diset'),
             'Set USER non-root di Dockerfile atau --user.')
     ports = ((c.get('NetworkSettings') or {}).get('Ports') or {})
     for cport, b2 in ports.items():
@@ -2317,6 +2332,7 @@ write_summary() {
     echo "Aset tdk jalan  : $(grep -c '^\[' "$OUT/aset_tidak_berjalan.txt" 2>/dev/null || echo 0) unit (aset_tidak_berjalan.txt)"
     echo "JDK terinstal   : $(wc -l < "$RAW/jdk_installs.txt" 2>/dev/null || echo 0) (dipakai: $(grep -c '|YA$' "$RAW/jdk_installs.txt" 2>/dev/null | head -n1))"
     [ -f "$RAW/container_detail.txt" ] && echo "Container       : $(grep -c '^== ' "$RAW/container_detail.txt" 2>/dev/null || echo 0) aktif (raw/container_detail.txt)"
+    [ -s "$OUT/.dkrps" ] || [ -n "$CRT_SRC" ] && echo "Akses container : mode=${DKR_MODE:-?} dibaca=${CRT_SRC:-TIDAK BISA} sebagai=${CRT_AS:--} (raw/container_access.txt)"
     echo "Library Java    : $(( $(wc -l < "$OUT/libraries.csv" 2>/dev/null || echo 1) - 1 )) baris inventaris (libraries.csv)"
     [ -f "$RAW/running_apps_other.txt" ] && echo "Aplikasi lain   : $(grep -c '^\[[0-9]*\] PID' "$RAW/running_apps_other.txt" 2>/dev/null | head -n1) non-Java berjalan (raw/running_apps_other.txt)"
     [ -s "$OUT/libraries_other.csv" ] && echo "Library lain    : $(( $(wc -l < "$OUT/libraries_other.csv") - 1 )) baris (npm/pypi/composer)"
@@ -2343,31 +2359,351 @@ write_summary() {
 # v4: CONTAINER MAP, RUNTIME NON-JAVA, PAKET OS, SBOM, KONFIGURASI, IOC
 #==============================================================================
 # Runtime container yang tersedia (docker/podman), kosong bila tidak ada
-CRT_BIN=""
+#------------------------------------------------------------------------------
+# AKSES CONTAINER RUNTIME
+#   Urutan: (1) root ke socket default (Docker biasa)
+#           (2) sebagai user pemilik daemon/socket (rootless, atau root diblokir)
+#           (3) root langsung ke socket rootless /run/user/<uid>/docker.sock
+#           (4) tanpa CLI: baca konfigurasi container dari disk
+#   Semua perintah yang dijalankan hanya membaca (ps, inspect, images, history,
+#   exec untuk daftar paket).
+#------------------------------------------------------------------------------
+CRT_BIN=""; CRT_SRC=""; CRT_AS=""; CRT_ROOT_ERR=""; DKR_MODE=""
+CRT_CMD=(); AS_CMD=()
+
+# Proses daemon: uid pid perintah
+dkr_scan_daemons() {
+  ps -eo uid=,pid=,args= 2>/dev/null | awk '{c=$3; sub(/.*\//,"",c)}
+    c=="dockerd" || c=="rootlesskit" || c ~ /^dockerd-rootless/ || (c=="podman" && $0 ~ /system service/)' > "$OUT/.dkrps"
+}
+
+# User non-root yang mungkin memiliki/mengakses daemon container
+dkr_candidate_users() {
+  local i s g gid
+  {
+    awk '$1!=0{print $1}' "$OUT/.dkrps" 2>/dev/null | while read -r i; do getent passwd "$i" | cut -d: -f1; done
+    for s in /run/user/*/docker.sock /run/user/*/podman/podman.sock; do [ -S "$s" ] && stat -c %U "$s"; done
+    for s in /var/run/docker.sock /run/docker.sock; do
+      [ -S "$s" ] || continue
+      g=$(stat -c %G "$s"); gid=$(stat -c %g "$s")
+      getent group "$g" | cut -d: -f4 | tr ',' '\n'
+      awk -F: -v g="$gid" '$4==g{print $1}' /etc/passwd
+    done
+  } 2>/dev/null | grep -vxE 'root|UNKNOWN|' | awk '!s[$0]++' | head -n 10
+}
+
+# Bangun AS_CMD untuk menjalankan perintah sebagai user $1 (setara: su <user>)
+as_user_cmd() {
+  local u="$1" uid h
+  uid=$(id -u "$u" 2>/dev/null) || return 1
+  h=$(getent passwd "$u" | cut -d: -f6)
+  if have runuser; then AS_CMD=(runuser -u "$u" --)
+  elif have sudo; then AS_CMD=(sudo -n -H -u "$u")
+  else return 1; fi
+  AS_CMD+=(env "HOME=${h:-/}" "XDG_RUNTIME_DIR=/run/user/$uid")
+  if [ -n "$DOCKER_HOST_OPT" ]; then AS_CMD+=("DOCKER_HOST=$DOCKER_HOST_OPT")
+  elif [ -S "/run/user/$uid/docker.sock" ]; then AS_CMD+=("DOCKER_HOST=unix:///run/user/$uid/docker.sock"); fi
+  return 0
+}
+
+# Folder data Docker (rootful dan rootless) untuk pembacaan tanpa CLI
+dkr_data_roots() {
+  local r u h
+  {
+    r=$(sed -n 's/.*"\(data-root\|graph\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\2/p' /etc/docker/daemon.json 2>/dev/null | head -n1)
+    echo "${r:-/var/lib/docker}"
+    grep -oE -- '--(data-root|graph)[= ][^ ]+' "$OUT/.dkrps" 2>/dev/null | sed -E 's/^--(data-root|graph)[= ]//'
+    for u in ${DOCKER_USER:-$(dkr_candidate_users)}; do
+      h=$(getent passwd "$u" | cut -d: -f6); [ -n "$h" ] || continue
+      echo "$h/.local/share/docker"
+      r=$(sed -n 's/.*"\(data-root\|graph\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\2/p' "$h/.config/docker/daemon.json" 2>/dev/null | head -n1)
+      [ -n "$r" ] && echo "$r"
+    done
+  } | awk '!s[$0]++' | while read -r r; do [ -d "$r/containers" ] && echo "$r"; done
+}
+
+# Peta container dari file config.v2.json + hostconfig.json (tanpa CLI)
+dkr_fs_map() {
+  local roots
+  roots=$(dkr_data_roots)
+  [ -n "$roots" ] || return 1
+  # shellcheck disable=SC2086
+  "$PY" - "$OUT" $roots <<'PYEOF'
+from __future__ import print_function
+import sys, os, io, json, glob, re
+out = sys.argv[1]; roots = sys.argv[2:]
+def wb(f, s):
+    if not isinstance(s, bytes): s = s.encode('utf-8')
+    f.write(s)
+def rj(p):
+    try:
+        return json.load(io.open(p, encoding='utf-8', errors='replace'))
+    except Exception:
+        return None
+cg = {}
+for p in os.listdir('/proc'):
+    if not p.isdigit(): continue
+    try: t = io.open('/proc/%s/cgroup' % p, encoding='utf-8', errors='replace').read()
+    except Exception: continue
+    for m in re.findall(r'[0-9a-f]{64}', t):
+        if m not in cg or int(p) < cg[m]: cg[m] = int(p)
+cmap = open(os.path.join(out, '.cmap'), 'ab'); lab = open(os.path.join(out, '.clabels'), 'ab')
+stp = open(os.path.join(out, '.cstopped'), 'ab'); src = open(os.path.join(out, '.cfs_source'), 'ab')
+insp = []; n = 0
+for r in roots:
+    for d in sorted(glob.glob(os.path.join(r, 'containers', '*'))):
+        c = rj(os.path.join(d, 'config.v2.json'))
+        if not isinstance(c, dict): continue
+        n += 1
+        hc = rj(os.path.join(d, 'hostconfig.json')) or {}
+        cid = c.get('ID') or os.path.basename(d); name = (c.get('Name') or cid[:12]).lstrip('/')
+        cfg = c.get('Config') or {}; st = c.get('State') or {}; image = cfg.get('Image') or c.get('Image') or '?'
+        labels = cfg.get('Labels') or {}
+        if not st.get('Running'):
+            wb(stp, u'%s (%s, berhenti)\n' % (name, image)); continue
+        pid = st.get('Pid') or 0
+        if cid in cg: pid = cg[cid]
+        mounts = [{'Source': m.get('Source', ''), 'Destination': m.get('Destination', '')}
+                  for m in (c.get('MountPoints') or {}).values() if isinstance(m, dict)]
+        ns = c.get('NetworkSettings') or {}
+        insp.append({'Id': cid, 'Name': '/' + name, 'Config': cfg, 'State': st, 'HostConfig': hc,
+                     'Mounts': mounts, 'NetworkSettings': {'Ports': ns.get('Ports') or hc.get('PortBindings') or {}}})
+        wb(cmap, u'%s\t%s\t%s\t%s\n' % (cid[:12], name, image, pid))
+        wb(lab, u'%s\t%s\t%s\n' % (cid[:12], labels.get('com.docker.compose.project.config_files', ''),
+                                   labels.get('com.docker.compose.project.working_dir', '')))
+    wb(src, u'%s\n' % r)
+f = open(os.path.join(out, '.cinsp_fs.json'), 'wb'); wb(f, json.dumps(insp)); f.close()
+for x in (cmap, lab, stp, src): x.close()
+sys.exit(0 if n else 1)
+PYEOF
+}
+
 detect_crt() {
-  if have docker && docker ps >/dev/null 2>&1; then CRT_BIN=docker
-  elif have podman && podman ps >/dev/null 2>&1; then CRT_BIN=podman
-  else CRT_BIN=""; fi
+  local b u s err bin so
+  CRT_BIN=""; CRT_SRC=""; CRT_AS=""; CRT_CMD=()
+  dkr_scan_daemons
+  # (1) root, socket default
+  if [ -z "$DOCKER_USER" ]; then
+    for b in docker podman; do
+      bin=$(command -v $b 2>/dev/null) || continue
+      if [ -n "$DOCKER_HOST_OPT" ] && [ "$b" = docker ]; then CRT_CMD=(env "DOCKER_HOST=$DOCKER_HOST_OPT" "$bin"); else CRT_CMD=("$bin"); fi
+      if err=$(timeout 20 "${CRT_CMD[@]}" ps -q 2>&1 >/dev/null); then
+        # podman root tanpa container: container bisa milik user lain, lanjut mencari
+        if [ "$b" = podman ] && [ -z "$(timeout 20 "${CRT_CMD[@]}" ps -aq 2>/dev/null)" ]; then CRT_CMD=(); continue; fi
+        CRT_BIN=$b; CRT_AS=root; CRT_SRC=cli; break
+      fi
+      CRT_CMD=()
+      [ "$b" = docker ] && CRT_ROOT_ERR=$(printf '%s' "$err" | head -n1 | cut -c1-220)
+    done
+  fi
+  # (2) sebagai user pemilik daemon / anggota grup socket
+  if [ -z "$CRT_SRC" ]; then
+    for u in ${DOCKER_USER:-$(dkr_candidate_users)}; do
+      as_user_cmd "$u" || continue
+      for b in docker podman; do
+        bin=$(command -v $b 2>/dev/null) || continue
+        if timeout 20 "${AS_CMD[@]}" "$bin" ps -q >/dev/null 2>&1; then
+          if [ "$b" = podman ] && [ -z "$DOCKER_USER" ] && [ -z "$(timeout 20 "${AS_CMD[@]}" "$bin" ps -aq 2>/dev/null)" ]; then continue; fi
+          CRT_CMD=("${AS_CMD[@]}" "$bin"); CRT_BIN=$b; CRT_AS=$u; CRT_SRC=cli; break 2
+        fi
+      done
+    done
+  fi
+  # (3) root langsung ke socket rootless
+  if [ -z "$CRT_SRC" ] && bin=$(command -v docker 2>/dev/null); then
+    for s in /run/user/*/docker.sock; do
+      [ -S "$s" ] || continue
+      if timeout 20 env "DOCKER_HOST=unix://$s" "$bin" ps -q >/dev/null 2>&1; then
+        CRT_CMD=(env "DOCKER_HOST=unix://$s" "$bin"); CRT_BIN=docker; CRT_AS="root ke $s"; CRT_SRC=cli; break
+      fi
+    done
+  fi
+  # (4) tanpa CLI
+  if [ -z "$CRT_SRC" ] && [ -n "$PY" ] && dkr_fs_map; then CRT_SRC=fs; CRT_BIN=docker; CRT_AS="file di disk"; fi
+  # mode daemon
+  DKR_MODE=""
+  awk '$1==0 {c=$3; sub(/.*\//,"",c); if (c=="dockerd") f=1} END{exit !f}' "$OUT/.dkrps" && DKR_MODE="rootful"
+  if awk '$1!=0 {c=$3; sub(/.*\//,"",c); if (c=="dockerd") f=1} END{exit !f}' "$OUT/.dkrps"; then
+    DKR_MODE="${DKR_MODE:+$DKR_MODE+}rootless"
+  elif [ "$CRT_SRC" = cli ] && [ "$CRT_BIN" = docker ]; then
+    so=$(timeout 20 "${CRT_CMD[@]}" info --format '{{json .SecurityOptions}}' 2>/dev/null)
+    case "$so" in *rootless*) DKR_MODE="${DKR_MODE:+$DKR_MODE+}rootless" ;; esac
+  fi
+  return 0
 }
 
 # Peta container aktif: id12 <TAB> nama <TAB> image <TAB> pid-utama
 build_container_map() {
-  : > "$OUT/.cmap"
+  : > "$OUT/.cmap"; : > "$OUT/.clabels"; : > "$OUT/.cpids"; : > "$OUT/.cstopped"
   detect_crt
-  [ -n "$CRT_BIN" ] || return 0
-  local id
-  for id in $($CRT_BIN ps -q --no-trunc 2>/dev/null); do
-    $CRT_BIN inspect -f '{{.Id}}	{{.Name}}	{{.Config.Image}}	{{.State.Pid}}' "$id" 2>/dev/null \
-      | awk -F'\t' '{sub(/^\//,"",$2); print substr($1,1,12) "\t" $2 "\t" $3 "\t" $4}' >> "$OUT/.cmap"
-  done
+  if [ "$CRT_SRC" = cli ]; then
+    local id
+    for id in $(timeout 30 "${CRT_CMD[@]}" ps -q --no-trunc 2>/dev/null); do
+      timeout 20 "${CRT_CMD[@]}" inspect -f '{{.Id}}	{{.Name}}	{{.Config.Image}}	{{.State.Pid}}	{{index .Config.Labels "com.docker.compose.project.config_files"}}	{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id" 2>/dev/null \
+        | awk -F'\t' -v CM="$OUT/.cmap" -v CL="$OUT/.clabels" '{sub(/^\//,"",$2); gsub(/<no value>/,""); i=substr($1,1,12)
+            print i "\t" $2 "\t" $3 "\t" $4 >> CM; print i "\t" $5 "\t" $6 >> CL}'
+    done
+  fi
+  [ -s "$OUT/.cmap" ] && ctr_pid_tree
+  [ -n "$CRT_SRC" ] && log "Container: $(wc -l < "$OUT/.cmap") aktif (dibaca: $CRT_SRC, sebagai: $CRT_AS, mode: ${DKR_MODE:-?})"
+  return 0
 }
 
-# ID container (12 hex) dari cgroup sebuah proses; kosong = proses host
+# PID utama container + semua turunannya -> id container
+# (Docker rootless di cgroup v1 tidak menulis id container ke /proc/PID/cgroup)
+ctr_pid_tree() {
+  awk '{l=$0; sub(/.*\) /,"",l); split(l,a," "); f=FILENAME; gsub(/[^0-9]/,"",f); print f, a[2]}' /proc/[0-9]*/stat 2>/dev/null > "$OUT/.ppid"
+  awk 'FNR==NR { if (NF>=4 && $4!=0) r[$4]=$1; next }
+       { par[$1]=$2 }
+       END { for (p in par) { q=p; n=0
+               while (q!="" && q!="0" && !(q in r) && n<64) { q=par[q]; n++ }
+               if (q in r) print p "\t" r[q] } }' FS='\t' "$OUT/.cmap" FS=' ' "$OUT/.ppid" > "$OUT/.cpids"
+  rm -f "$OUT/.ppid"
+}
+
+# ID container (12 hex) sebuah proses; kosong = proses host
 pid_container() {
   [ -s "$OUT/.cmap" ] || return 0
   local id
   id=$(grep -oE '[0-9a-f]{64}' "/proc/$1/cgroup" 2>/dev/null | head -n1 | cut -c1-12)
-  [ -n "$id" ] && grep -q "^$id	" "$OUT/.cmap" && echo "$id"
+  if [ -n "$id" ] && grep -q "^$id	" "$OUT/.cmap"; then echo "$id"; return 0; fi
+  [ -s "$OUT/.cpids" ] && awk -F'\t' -v p="$1" '$1==p{print $2; exit}' "$OUT/.cpids"
+  return 0
+}
+
+#------------------------------------------------------------------------------
+# SIAPA YANG BISA MENGENDALIKAN DAEMON CONTAINER
+#   Docker biasa (daemon root): akses socket = setara root host.
+#   Docker rootless: akses socket = kendali semua container milik user itu.
+#------------------------------------------------------------------------------
+# Proses aplikasi milik user di HOST (bukan di dalam container): "comm(PID) ..."
+user_host_apps() {
+  local pid comm out=""
+  while read -r pid comm; do
+    [ -n "$pid" ] || continue
+    [ -n "$(pid_container "$pid")" ] && continue
+    out="$out $comm($pid)"
+  done < <(ps -u "$1" -o pid=,comm= 2>/dev/null | awk '$2 ~ /^(java|node|nodejs|python[0-9.]*|php[0-9.]*|php-fpm.*|ruby|perl|httpd|nginx|gunicorn|uwsgi|beam.smp|dotnet)$/')
+  echo "$out" | awk '{for(i=1;i<=NF && i<=6;i++) printf "%s ", $i; if (NF>6) printf "(+%d lagi)", NF-6}'
+}
+
+# Cara user bisa dimasuki: shell login, kunci SSH, password
+user_login_info() {
+  local u="$1" sh h pw r=""
+  sh=$(getent passwd "$u" | cut -d: -f7); h=$(getent passwd "$u" | cut -d: -f6)
+  case "$sh" in */nologin|*/false|"") r="shell=$sh(tidak bisa login)" ;; *) r="shell=$sh" ;; esac
+  [ -s "$h/.ssh/authorized_keys" ] && r="$r, ada authorized_keys"
+  pw=$(awk -F: -v u="$u" '$1==u{print substr($2,1,1)}' /etc/shadow 2>/dev/null)
+  case "$pw" in '!'|'*'|'') r="$r, password terkunci" ;; *) r="$r, password aktif" ;; esac
+  echo "$r"
+}
+
+# Baris sudoers yang menyebut kata tertentu (tanpa komentar)
+sudoers_lines() {
+  grep -hsE "^[[:space:]]*[^#[:space:]].*\b$1\b" /etc/sudoers /etc/sudoers.d/* 2>/dev/null | sed 's/[[:space:]]\+/ /g' | head -n 10
+}
+
+check_docker_access() {
+  [ -s "$OUT/.dkrps" ] || have docker || have podman || [ -S /var/run/docker.sock ] || return 0
+  log "Cek siapa yang bisa mengendalikan daemon container"
+  local f="$RAW/container_access.txt" s g gid u apps login sev ev mitig="" rec via
+  local rl_users dkr_users="" sd finding_title id
+  {
+    echo "Proses daemon (uid pid perintah):"; cat "$OUT/.dkrps"
+    echo; echo "Mode daemon             : ${DKR_MODE:-tidak terdeteksi}"
+    echo "Container dibaca lewat  : ${CRT_SRC:-TIDAK BISA} ${CRT_BIN:+($CRT_BIN, sebagai: $CRT_AS)}"
+    [ -n "$CRT_ROOT_ERR" ] && echo "docker sebagai root     : $CRT_ROOT_ERR"
+    [ -s "$OUT/.cfs_source" ] && echo "Folder data dibaca      : $(tr '\n' ' ' < "$OUT/.cfs_source")"
+    echo; echo "Socket:"
+    for s in /var/run/docker.sock /run/docker.sock /run/user/*/docker.sock /run/podman/podman.sock /run/user/*/podman/podman.sock; do
+      [ -S "$s" ] || continue
+      ls -l "$s"
+      have getfacl && getfacl -p "$s" 2>/dev/null | grep -vE '^#|^$|^(user|group|other|mask)::'
+    done
+    echo; echo "Isi /etc/docker/daemon.json:"; grep -vE '^\s*$' /etc/docker/daemon.json 2>/dev/null || echo "(tidak ada)"
+    echo; echo "sudoers yang menyebut docker/podman:"; sudoers_lines docker; sudoers_lines podman
+  } > "$f" 2>/dev/null
+
+  # mitigasi daemon root
+  { grep -qs '"authorization-plugins"' /etc/docker/daemon.json || grep -q -- '--authorization-plugin' "$OUT/.dkrps"; } && mitig="$mitig plugin-otorisasi"
+  { grep -qs '"userns-remap"' /etc/docker/daemon.json || grep -q -- '--userns-remap' "$OUT/.dkrps"; } && mitig="$mitig userns-remap"
+
+  # --- Docker biasa: daemon berjalan sebagai root ---
+  case "$DKR_MODE" in rootful*)
+    for s in /var/run/docker.sock /run/docker.sock; do
+      [ -S "$s" ] || continue
+      g=$(stat -c %G "$s" 2>/dev/null); gid=$(stat -c %g "$s" 2>/dev/null)
+      for u in $(getent group "$g" | cut -d: -f4 | tr ',' ' '); do dkr_users="$dkr_users $u:grup-$g"; done
+      for u in $(awk -F: -v g="$gid" '$4==g{print $1}' /etc/passwd); do dkr_users="$dkr_users $u:grup-utama-$g"; done
+      if have getfacl; then
+        for u in $(getfacl -p "$s" 2>/dev/null | awk -F: '$1=="user" && $2!="" && $3 ~ /w/{print $2}'); do dkr_users="$dkr_users $u:ACL"; done
+      fi
+      break
+    done
+    for sd in $(sudoers_lines docker | awk '{print $1}' | grep -vxE 'root|Defaults' | sort -u); do
+      case "$sd" in %*) for u in $(getent group "${sd#%}" | cut -d: -f4 | tr ',' ' '); do dkr_users="$dkr_users $u:sudo-docker"; done ;;
+                     *) dkr_users="$dkr_users $sd:sudo-docker" ;; esac
+    done
+    for u in $(echo "$dkr_users" | tr ' ' '\n' | cut -d: -f1 | grep -vxE 'root|' | sort -u); do
+      via=$(echo "$dkr_users" | tr ' ' '\n' | awk -F: -v u="$u" '$1==u{print $2}' | sort -u | tr '\n' ',' | sed 's/,$//')
+      apps=$(user_host_apps "$u"); login=$(user_login_info "$u")
+      if [ -n "$apps" ]; then
+        sev=CRITICAL
+        ev="user $u (lewat $via) menjalankan aplikasi di host: $apps; $login"
+        rec="Aplikasi yang diretas (mis. webshell) langsung bisa menjadi root host lewat docker run --privileged -v /:/host. Perbaikan: (1) jalankan aplikasi host dengan user lain yang TIDAK punya akses Docker: gpasswd -d $u ${g:-docker}; (2) operasi docker hanya dari user admin terpisah; (3) sasaran jangka panjang: Docker rootless dengan user khusus; (4) pantau socket: auditctl -w /var/run/docker.sock -p rwxa -k docker-sock."
+        finding_title="User aplikasi bisa mengendalikan Docker daemon yang berjalan sebagai root (aplikasi diretas = root host)"
+        id=DKR-ROOTEQ-01
+      else
+        sev=HIGH
+        ev="user $u (lewat $via); $login"
+        rec="Akses ke Docker daemon root setara root host. Batasi hanya untuk admin yang memang perlu (gpasswd -d $u ${g:-docker}), wajibkan login perorangan + audit (auditctl -w /var/run/docker.sock -p rwxa -k docker-sock)."
+        finding_title="User non-root bisa mengendalikan Docker daemon yang berjalan sebagai root (setara root)"
+        id=DKR-ROOTEQ-02
+      fi
+      [ -n "$CRT_ROOT_ERR" ] && [ "$CRT_AS" = "$u" ] && ev="$ev; root ditolak menjalankan docker tetapi daemon tetap berjalan sebagai root: pemblokiran root tidak mengurangi risiko ini"
+      if echo "$mitig" | grep -q plugin-otorisasi; then
+        case "$sev" in CRITICAL) sev=HIGH ;; HIGH) sev=MEDIUM ;; esac
+        ev="$ev; plugin otorisasi terpasang (verifikasi plugin menolak --privileged, bind mount /, --pid=host, --userns=host)"
+      fi
+      echo "$mitig" | grep -q userns-remap && ev="$ev; userns-remap aktif (masih bisa dilewati dengan --userns=host bila tidak dicegah plugin otorisasi)"
+      finding "$sev" "$id" Container "$finding_title" "$ev" "$rec"
+    done
+    ;;
+  esac
+
+  # --- Docker rootless ---
+  case "$DKR_MODE" in *rootless*)
+    rl_users=$(awk '$1!=0 {c=$3; sub(/.*\//,"",c); if (c=="dockerd") print $1}' "$OUT/.dkrps" | sort -u | while read -r u; do getent passwd "$u" | cut -d: -f1; done)
+    [ -z "$rl_users" ] && [ -n "$CRT_AS" ] && rl_users="$CRT_AS"
+    for u in $rl_users; do
+      s="/run/user/$(id -u "$u" 2>/dev/null)/docker.sock"
+      login=$(user_login_info "$u")
+      finding INFO DKR-ROOTLESS-01 Container "Docker berjalan rootless sebagai user $u (container tidak memberi jalan ke root host)" \
+        "dockerd uid $(id -u "$u" 2>/dev/null); socket $(ls -l "$s" 2>/dev/null | awk '{print $1, $3}') $s; $login" \
+        "Pertahankan. Pastikan socket tetap mode 660/600 milik $u dan hanya admin tertentu yang boleh su/sudo ke $u."
+      apps=$(user_host_apps "$u")
+      [ -n "$apps" ] && finding MEDIUM DKR-ROOTLESS-02 Container "User pemilik Docker rootless ($u) juga menjalankan aplikasi di host" \
+        "$u menjalankan: $apps" \
+        "Aplikasi host yang diretas bisa mengendalikan SEMUA container $u (membaca data, secret, environment). Jalankan aplikasi host dengan user lain, atau pindahkan aplikasinya ke container."
+      sd=$(sudoers_lines "$u")
+      [ -n "$sd" ] && echo "sudoers yang menyebut $u: $sd" >> "$f"
+      if [ -n "$CRT_AS" ] && [ "$CRT_AS" != "$u" ] && [ "$CRT_SRC" = cli ]; then
+        finding INFO DKR-MULTI-01 Container "Daemon rootless milik user $u tidak ikut diperiksa" "script membaca daemon $CRT_AS" "Jalankan ulang: sudo bash assess.sh --docker-user $u"
+      fi
+    done
+    ;;
+  esac
+
+  # --- Bagian container tidak bisa diperiksa ---
+  if [ -z "$CRT_SRC" ]; then
+    finding MEDIUM DKR-NOACCESS-01 Container "Container runtime terpasang tetapi tidak bisa ditanya: bagian container TIDAK diperiksa" \
+      "daemon: $(awk '{print "uid " $1 " " $3}' "$OUT/.dkrps" | tr '\n' ';')${CRT_ROOT_ERR:+ root: $CRT_ROOT_ERR}" \
+      "Jalankan ulang dengan user yang biasa dipakai untuk docker: sudo bash assess.sh --docker-user <user>"
+  elif [ "$CRT_SRC" = fs ]; then
+    finding LOW DKR-FSONLY-01 Container "Container dibaca dari file konfigurasi di disk (CLI tidak bisa dipakai)" \
+      "folder: $(tr '\n' ' ' < "$OUT/.cfs_source" 2>/dev/null)" \
+      "Postur dan library container tetap diperiksa; image tersimpan dan riwayat build TIDAK. Untuk hasil lengkap: sudo bash assess.sh --docker-user <user>"
+  fi
   return 0
 }
 ctr_name()    { awk -F'\t' -v i="$1" '$1==i{print $2; exit}' "$OUT/.cmap" 2>/dev/null; }
@@ -2581,9 +2917,9 @@ collect_os_packages() {
   while IFS=$'\t' read -r id name _img _pid; do
     d="$base/container__$name"; mkdir -p "$d"; ok=0
     log "Kumpulkan daftar paket OS container: $name"
-    if [ "$NO_EXEC" -eq 0 ] && [ "$SAFE" -eq 0 ]; then
+    if [ "$NO_EXEC" -eq 0 ] && [ "$SAFE" -eq 0 ] && [ "$CRT_SRC" = cli ]; then
       tmp="$d/exec.out"
-      ctr_pkg_script | timeout 90 $CRT_BIN exec -i "$name" sh -s > "$tmp" 2>/dev/null
+      ctr_pkg_script | timeout 90 "${CRT_CMD[@]}" exec -i "$name" sh -s > "$tmp" 2>/dev/null
       if grep -q '^#PKGS' "$tmp" 2>/dev/null; then
         sed -n '1,/^#REL /p' "$tmp" | grep -v '^#REL ' > "$d/osrelease"
         sed -n 's/^#REL //p' "$tmp" | head -n 1 > "$d/rel"
@@ -3038,7 +3374,7 @@ warn('SBOM: %d file, %d library non-Java, %d paket OS' % (len(summary), len(rows
 PYEOF
   [ -s "$OUT/sbom/RINGKASAN.txt" ] && cp "$OUT/sbom/RINGKASAN.txt" "$RAW/sbom_ringkasan.txt"
   grep -qE 'Traceback|Error' "$RAW/sbom_errors.txt" 2>/dev/null && log "PERINGATAN: pembuatan SBOM bermasalah (lihat raw/sbom_errors.txt)"
-  rm -rf "$OUT/.ospk" "$OUT/.otherapps"
+  rm -rf "$OUT/.ospk" "$OUT/.otherapps" "$OUT/.cinsp_fs.json" "$OUT/.cfs_source"
   return 0
 }
 
@@ -3105,19 +3441,17 @@ collect_container_configs() {
   : > "$list.all"
   [ -s "$list" ] && cat "$list" >> "$list.all"
   # file compose milik container yang sedang berjalan (dari label compose)
-  if [ -n "$CRT_BIN" ] && [ -s "$OUT/.cmap" ]; then
-    while IFS=$'\t' read -r id _n _i _p; do
-      x=$($CRT_BIN inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$id" 2>/dev/null)
-      d=$($CRT_BIN inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id" 2>/dev/null)
+  if [ -s "$OUT/.clabels" ]; then
+    while IFS=$'\t' read -r id x d; do
       echo "$x" | tr ',' '\n' | while read -r f; do
         [ -z "$f" ] && continue
         [ "${f#/}" = "$f" ] && f="$d/$f"
         echo "$f"
       done >> "$list.all"
       [ -n "$d" ] && for f in "$d"/Dockerfile* "$d"/*.dockerfile "$d"/Containerfile; do [ -f "$f" ] && echo "$f"; done >> "$list.all"
-    done < "$OUT/.cmap"
+    done < "$OUT/.clabels"
   fi
-  sort -u "$list.all" | grep -vE '/(node_modules|vendor|\.git|site-packages)/|^/usr/(share|lib|lib64)/|^/var/lib/(docker|containers|containerd)/' > "$list.sorted"
+  sort -u "$list.all" | grep -vE '/(node_modules|vendor|\.git|site-packages)/|^/usr/(share|lib|lib64)/|^/var/lib/(docker|containers|containerd)/|/assess-[^/]+/config/' > "$list.sorted"
   mkdir -p "$OUT/config"
   : > "$OUT/config/INDEX.txt"
   while read -r f; do
@@ -3163,23 +3497,28 @@ check_compose_files() {
 
 # Image yang tersimpan tapi tidak dipakai, container berhenti, dan riwayat build image
 check_idle_images() {
-  [ -n "$CRT_BIN" ] || return 0
   local used all idle stopped
-  $CRT_BIN ps -a --no-trunc --format '{{.Image}}' 2>/dev/null | sort -u > "$OUT/.imgused"
-  $CRT_BIN ps -aq 2>/dev/null | while read -r x; do $CRT_BIN inspect -f '{{.Image}}' "$x" 2>/dev/null; done | sed 's/^sha256://' | cut -c1-12 | sort -u >> "$OUT/.imgused"
-  $CRT_BIN images --format '{{.ID}}	{{.Repository}}:{{.Tag}}	{{.CreatedSince}}	{{.Size}}' 2>/dev/null > "$OUT/.imgall"
+  if [ "$CRT_SRC" = fs ]; then
+    [ -s "$OUT/.cstopped" ] && finding LOW CNT-STOP-01 Container "$(wc -l < "$OUT/.cstopped") container berhenti masih tersimpan" "$(head -n 8 "$OUT/.cstopped" | tr '\n' ';')" \
+      "Hapus container yang tidak dipakai (docker rm). Container berhenti masih menyimpan filesystem dan environment variable-nya."
+    return 0
+  fi
+  [ "$CRT_SRC" = cli ] || return 0
+  "${CRT_CMD[@]}" ps -a --no-trunc --format '{{.Image}}' 2>/dev/null | sort -u > "$OUT/.imgused"
+  "${CRT_CMD[@]}" ps -aq 2>/dev/null | while read -r x; do "${CRT_CMD[@]}" inspect -f '{{.Image}}' "$x" 2>/dev/null; done | sed 's/^sha256://' | cut -c1-12 | sort -u >> "$OUT/.imgused"
+  "${CRT_CMD[@]}" images --format '{{.ID}}	{{.Repository}}:{{.Tag}}	{{.CreatedSince}}	{{.Size}}' 2>/dev/null > "$OUT/.imgall"
   idle=$(awk -F'\t' 'NR==FNR{u[$1]=1; next} !(substr($1,1,12) in u) && !($2 in u){print $2 " (" $3 ", " $4 ")"}' "$OUT/.imgused" "$OUT/.imgall")
   if [ -n "$idle" ]; then
     echo "$idle" > "$RAW/container_images_idle.txt"
     finding LOW CNT-IDLE-01 Container "$(echo "$idle" | wc -l) image tersimpan tetapi tidak dipakai container mana pun" "$(echo "$idle" | head -n 8 | tr '\n' ';')" \
       "Hapus image yang tidak dipakai (docker image rm / docker image prune). Image lama menyimpan library rentan dan bisa dijalankan kembali."
   fi
-  stopped=$($CRT_BIN ps -a --filter status=exited --filter status=created --format '{{.Names}} ({{.Image}}, {{.Status}})' 2>/dev/null)
+  stopped=$("${CRT_CMD[@]}" ps -a --filter status=exited --filter status=created --format '{{.Names}} ({{.Image}}, {{.Status}})' 2>/dev/null)
   [ -n "$stopped" ] && finding LOW CNT-STOP-01 Container "$(echo "$stopped" | wc -l) container berhenti masih tersimpan" "$(echo "$stopped" | head -n 8 | tr '\n' ';')" \
     "Hapus container yang tidak dipakai (docker rm). Container berhenti masih menyimpan filesystem dan environment variable-nya."
   # riwayat build (pengganti Dockerfile bila tidak ada di server); secret disamarkan
   cut -f2 "$OUT/.imgall" | grep -v '<none>' | sort -u | head -n 40 | while read -r x; do
-    echo "##### $x"; $CRT_BIN history --no-trunc --format '{{.CreatedBy}}' "$x" 2>/dev/null | redact_cfg | cut -c1-400; echo
+    echo "##### $x"; "${CRT_CMD[@]}" history --no-trunc --format '{{.CreatedBy}}' "$x" 2>/dev/null | redact_cfg | cut -c1-400; echo
   done > "$RAW/container_image_history.txt" 2>/dev/null
   [ -s "$RAW/container_image_history.txt" ] || rm -f "$RAW/container_image_history.txt"
   rm -f "$OUT/.imgused" "$OUT/.imgall"
@@ -3411,6 +3750,7 @@ main() {
   discover_running_apps
   discover_other_runtimes
   check_unknown_listeners
+  check_docker_access
   detect_and_check_roles
   check_manual_paths
   check_extra
