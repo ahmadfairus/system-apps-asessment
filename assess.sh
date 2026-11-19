@@ -47,7 +47,7 @@
 set -u
 umask 077
 
-SCRIPT_VERSION="4.1"
+SCRIPT_VERSION="4.2"
 OUTBASE="/tmp"
 SKIP_FS=0
 NO_NET=0
@@ -108,7 +108,15 @@ ARCH_SEEN=" "     # arsip jar/war/ear yang sudah dicek
 DIR_SEEN=" "      # folder lib/aplikasi yang sudah dicek
 JAVA_SEEN=" "     # binary java yang sudah dicek versinya
 ART_BYTES=0
-run_path() { [ -n "$1" ] && readlink -f "$1" >> "$OUT/.running" 2>/dev/null; return 0; }
+# Normalisasi path. Path di dalam container (/proc/<pid>/root/...) TIDAK boleh
+# di-readlink -f karena awalan itu akan hilang dan berubah menjadi path host.
+rpath() {
+  case "$1" in
+    /proc/[0-9]*/root|/proc/[0-9]*/root/*) printf '%s\n' "$1" | sed -E 's#/+#/#g; s#/(\./)+#/#g; s#/$##' ;;
+    *) readlink -f "$1" ;;
+  esac
+}
+run_path() { [ -n "$1" ] && rpath "$1" >> "$OUT/.running" 2>/dev/null; return 0; }
 APP_PERM_DIRS=""
 MAPFILE=""
 ANON_HOST=""
@@ -167,7 +175,20 @@ ver_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head
 is_loopback() { case "$1" in 127.*|::1|\[::1\]|::ffff:127.*|\[::ffff:127.*) return 0 ;; esac; return 1; }
 
 # Alamat:port yang di-listen (TCP) oleh PID tertentu
-listen_of_pid() { ss -tlnp 2>/dev/null | awk -v p="pid=$1," 'index($0,p){print $4}' | sort -u; }
+listen_of_pid() {
+  local r
+  r=$(ss -tlnp 2>/dev/null | awk -v p="pid=$1," 'index($0,p){print $4}' | sort -u)
+  if [ -z "$r" ] && [ -r "/proc/$1/net/tcp" ] && [ "$(readlink "/proc/$1/ns/net" 2>/dev/null)" != "$(readlink /proc/1/ns/net 2>/dev/null)" ]; then
+    # proses di network namespace lain: baca socket LISTEN namespace itu
+    r=$(awk 'function h(x,  i,c,v){v=0; x=toupper(x); for(i=1;i<=length(x);i++){c=index("0123456789ABCDEF",substr(x,i,1))-1; v=v*16+c} return v}
+      FNR>1 && $4=="0A" { split($2,a,":"); ad=a[1]; pt=h(a[2])
+        if (length(ad)==8) ip=h(substr(ad,7,2)) "." h(substr(ad,5,2)) "." h(substr(ad,3,2)) "." h(substr(ad,1,2))
+        else ip=(ad ~ /^0+$/) ? "[::]" : "[ipv6]"
+        print ip ":" pt }' "/proc/$1/net/tcp" "/proc/$1/net/tcp6" 2>/dev/null | sort -u)
+  fi
+  [ -n "$r" ] && echo "$r"
+  return 0
+}
 
 # Alamat target untuk request lokal berdasarkan alamat listen
 target_of() {
@@ -289,7 +310,7 @@ classpath_dirs() {
 # Hasil: libraries.csv. Aturan "flag cepat" dibaca dari file aturan (opsional).
 #------------------------------------------------------------------------------
 # reg_archive LABEL FILE
-reg_archive() { [ -f "$2" ] && printf '%s\t%s\n' "$1" "$(readlink -f "$2")" >> "$OUT/.archives"; return 0; }
+reg_archive() { [ -f "$2" ] && printf '%s\t%s\n' "$1" "$(rpath "$2")" >> "$OUT/.archives"; return 0; }
 
 # Aturan bawaan, dipakai bila tidak ada --lib-rules / lib_rules.txt
 default_lib_rules() { cat <<'RULES'
@@ -1063,7 +1084,7 @@ register_disk_archives() {
   grep '/jboss-modules\.jar$' "$RAW/disk_archives.txt" | while read -r f; do echo "$(dirname "$f")"; done > "$OUT/.wfhomes"
   while read -r jh; do
     [ -d "$jh/modules" ] || continue
-    case "$WF_SEEN" in *" $(readlink -f "$jh") "*) continue ;; esac
+    case "$WF_SEEN" in *" $(rpath "$jh") "*) continue ;; esac
     log "  -> instalasi WildFly/JBoss ditemukan (tidak berjalan): $jh"
     scan_wildfly_home "$jh"
   done < "$OUT/.wfhomes"; rm -f "$OUT/.wfhomes"
@@ -1495,7 +1516,7 @@ tagof() { echo "$1" | tr -c 'A-Za-z0-9._\n-' '_'; }
 # config di dalam arsip, dan (opsional) salin sebagai artefak. Return 1 jika sudah pernah/ bukan zip.
 scan_app_archive() {
   local f label="$2" cfg="${3:-}" rf ents libs sbver e
-  rf=$(readlink -f "$1")
+  rf=$(rpath "$1")
   case "$ARCH_SEEN" in *" $rf "*) return 1 ;; esac
   ARCH_SEEN="$ARCH_SEEN$rf "
   is_zip "$rf" || return 1
@@ -1522,7 +1543,7 @@ scan_app_archive() {
 # scan_lib_dir DIR LABEL -> library lepas (*.jar) dalam 1 folder, mis. folder classpath "lib/"
 scan_lib_dir() {
   local d label="$2" list f
-  d=$(readlink -f "$1"); [ -d "$d" ] || return 0
+  d=$(rpath "$1"); [ -d "$d" ] || return 0
   case "$DIR_SEEN" in *" $d "*) return 0 ;; esac
   DIR_SEEN="$DIR_SEEN$d "
   list="$RAW/libdir_$(tagof "$label")_$(tagof "$(basename "$d")")_libs.txt"
@@ -1679,7 +1700,7 @@ PYEOF
 # wildfly_static JBOSS_HOME BASE_DIR [NAMA_CONFIG] [domain]
 wildfly_static() {
   local jh base="$2" cfgname="${3:-}" mode="${4:-}" wpid="${5:-}" label cfg ver major n f dep d tmpl jhome
-  jh=$(readlink -f "$1")
+  jh=$(rpath "$1")
   case "$WF_SEEN" in *" $jh "*) return 0 ;; esac
   WF_SEEN="$WF_SEEN$jh "
   label=$(basename "$jh")
@@ -1784,6 +1805,41 @@ wildfly_static() {
     "Bersihkan konten yang tidak terdaftar (WildFly CLI: /deployment=... remove, atau hapus folder data/content/<hash> saat server berhenti)."
   [ -n "$disabled" ] && finding LOW WF-DEP-01 WildFly "Deployment nonaktif masih tersimpan di server" "$label:$disabled" \
     "Bila tidak dipakai lagi: undeploy --name=<nama> (jangan sekadar disable) agar kode lama ikut terhapus."
+  # Status deployment (hanya WildFly yang berjalan): aplikasi benar ter-deploy atau WildFly kosong?
+  if [ -n "$wpid" ]; then
+    local dstat="$RAW/wildfly_${label}_deploy_status.txt" ok="" bad="" mg ctx logdep logbad all logf="$base/log/server.log"
+    for f in "$base"/deployments/*.deployed; do [ -e "$f" ] && ok="$ok $(basename "${f%.deployed}")"; done
+    for f in "$base"/deployments/*.failed; do [ -e "$f" ] && bad="$bad $(basename "${f%.failed}")"; done
+    mg=$(awk '$2=="ya"{print $3}' "$depmap" 2>/dev/null | tr '\n' ' ')
+    {
+      echo "Folder deployments, berhasil (.deployed) :${ok:- (tidak ada)}"
+      echo "Folder deployments, gagal (.failed)      :${bad:- (tidak ada)}"
+      echo "Terdaftar aktif di konfigurasi (CLI/console): ${mg:-(tidak ada)}"
+      echo
+      if [ -r "$logf" ]; then
+        echo "server.log: baris terkait deployment (40 terakhir dari 20000 baris terakhir)"
+        tail -n 20000 "$logf" 2>/dev/null | grep -E 'WFLYSRV0010|WFLYSRV0009|WFLYUT0021|WFLYSRV0025|WFLYSRV0026|WFLYCTL0013|WFLYCTL0186|Operation \("deploy"\)' | tail -n 40 | cut -c1-300 | redact
+      else
+        echo "server.log tidak terbaca: $logf"
+      fi
+    } > "$dstat" 2>/dev/null
+    ctx=$(grep -oE "WFLYUT0021: Registered web context: '[^']*'" "$dstat" | sed "s/.*context: //" | sort -u | tr '\n' ' ')
+    logdep=$(grep -oE 'WFLYSRV0010: Deployed "[^"]*"' "$dstat" | sed 's/.*Deployed //' | tr -d '"' | sort -u | tr '\n' ' ')
+    logbad=$(grep -cE 'WFLYCTL0013|WFLYCTL0186|Operation \("deploy"\)' "$dstat" 2>/dev/null | head -n1)
+    all=$(echo "$ok $mg" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+    if [ -n "$bad" ] || [ "${logbad:-0}" -gt 0 ]; then
+      finding MEDIUM WF-DEPST-02 WildFly "Ada deployment yang gagal" "$label:${bad:+ gagal:$bad;} ${logbad:-0} baris error deployment di server.log" \
+        "Lihat raw/wildfly_${label}_deploy_status.txt. Aplikasi yang gagal tidak berjalan dan tidak bisa dinilai; perbaiki lalu deploy ulang."
+    fi
+    if [ -z "$all" ]; then
+      finding INFO WF-DEPST-00 WildFly "WildFly berjalan TANPA aplikasi ter-deploy" \
+        "$label: folder deployments & konfigurasi kosong${logdep:+; log mencatat pernah deploy: $logdep}" \
+        "Yang bisa dinilai baru platform (WildFly, Java, konfigurasi). Ulangi assessment setelah aplikasi di-deploy."
+    else
+      finding INFO WF-DEPST-01 WildFly "Aplikasi ter-deploy di WildFly" "$label: $all${ctx:+; context web: $ctx}" \
+        "Pastikan hanya aplikasi ini yang seharusnya ada di server ini."
+    fi
+  fi
   find "$jh/modules" -name '*.jar' -printf 'modules!/%f\n' 2>/dev/null >> "$tmpl"
   [ "$SAFE" -eq 0 ] && while read -r f; do reg_archive "$label/modules" "$f"; done < <(find "$jh/modules" -name '*.jar' 2>/dev/null)
 }
@@ -1821,7 +1877,7 @@ check_other_java() {
 # PATH MANUAL (parameter / prompt)
 #------------------------------------------------------------------------------
 scan_wildfly_home() {
-  local jh; jh=$(readlink -f "$1" 2>/dev/null)
+  local jh; jh=$(rpath "$1" 2>/dev/null)
   if [ ! -f "$jh/jboss-modules.jar" ]; then
     finding INFO PATH-WF-01 Path "Path WildFly tidak valid (jboss-modules.jar tidak ada)" "$1" "Periksa kembali path WildFly/JBoss home."
     return
@@ -1833,7 +1889,7 @@ scan_wildfly_home() {
 
 scan_app_dir() {
   local d label cfg f loose n=0
-  d=$(readlink -f "$1" 2>/dev/null)
+  d=$(rpath "$1" 2>/dev/null)
   if [ ! -d "$d" ]; then
     finding INFO PATH-APP-01 Path "Path aplikasi tidak ditemukan" "$1" "Periksa kembali path folder aplikasi."
     return
@@ -1844,7 +1900,7 @@ scan_app_dir() {
   cfg="$OUT/.cfg.$$"; : > "$cfg"
   loose="$RAW/appdir_$(tagof "$label")_loose_libs.txt"; : > "$loose"
   while read -r f; do
-    case "$ARCH_SEEN" in *" $(readlink -f "$f") "*) n=$((n+1)); continue ;; esac
+    case "$ARCH_SEEN" in *" $(rpath "$f") "*) n=$((n+1)); continue ;; esac
     if zip_list "$f" | grep -qE '^(BOOT-INF/|WEB-INF/|META-INF/application\.xml)'; then
       scan_app_archive "$f" "$label" "$cfg" && n=$((n+1))
     else
@@ -1861,7 +1917,7 @@ scan_app_dir() {
 }
 
 check_java_home() {
-  local exe; exe="$(readlink -f "$1" 2>/dev/null)/bin/java"
+  local exe; exe="$(rpath "$1" 2>/dev/null)/bin/java"
   if [ ! -x "$exe" ]; then
     finding INFO PATH-JAVA-01 Path "Path JAVA_HOME tidak valid (bin/java tidak ada)" "$1" "Periksa kembali path JDK/JRE."
     return
@@ -1982,7 +2038,7 @@ check_containers() {
     else cp "$OUT/.cinsp_fs.json" "$insp" 2>/dev/null; fi
     "$PY" - "$insp" "$CRT" "$merged" "$det" "${DKR_MODE:-}" <<'PYEOF' | while IFS=$'\t' read -r sev id title ev rec; do
 from __future__ import print_function
-import sys, json, io
+import sys, json, io, re
 try:
     data = json.load(io.open(sys.argv[1], encoding='utf-8', errors='replace'))
 except Exception as e:
@@ -2046,6 +2102,15 @@ for c in data:
     if user in ('','0','root','0:0'):
         out('LOW' if RL else 'MEDIUM','CNT-USER-01','Proses dalam container berjalan sebagai root' + (' (rootless: root container = user pemilik daemon di host)' if RL else ''),'%s (User=%s)' % (name, user or 'tidak diset'),
             'Set USER non-root di Dockerfile atau --user.')
+    envn = []
+    for e in (cfg.get('Env') or []):
+        k = e.split('=', 1)[0]
+        v = e.split('=', 1)[1] if '=' in e else ''
+        if re.search(r'(PASS|PWD|SECRET|TOKEN|KEY|CRED|AUTH)', k, re.I) and v and not v.startswith('/') and not re.search(r'_FILE$', k, re.I):
+            envn.append(k)
+    if envn:
+        out('MEDIUM','CNT-ENV-01','Secret disimpan di environment variable container (terbaca lewat docker inspect)','%s: %s (nilai tidak dicatat)' % (name, ', '.join(sorted(set(envn)))),
+            'Pindahkan ke file secret yang di-mount read-only (mis. Docker secrets atau volume ber-izin 0400) dan baca lewat variabel *_FILE. Ganti nilai secret bila image/inspect pernah dibagikan.')
     ports = ((c.get('NetworkSettings') or {}).get('Ports') or {})
     for cport, b2 in ports.items():
         for b in (b2 or []):
@@ -2319,7 +2384,7 @@ detect_and_check_roles() {
 }
 
 write_summary() {
-  local s
+  local s n
   {
     echo "Host            : $HOST"
     echo "Waktu           : $(date '+%Y-%m-%d %H:%M:%S %z')"
@@ -2332,6 +2397,7 @@ write_summary() {
     echo "Aset tdk jalan  : $(grep -c '^\[' "$OUT/aset_tidak_berjalan.txt" 2>/dev/null || echo 0) unit (aset_tidak_berjalan.txt)"
     echo "JDK terinstal   : $(wc -l < "$RAW/jdk_installs.txt" 2>/dev/null || echo 0) (dipakai: $(grep -c '|YA$' "$RAW/jdk_installs.txt" 2>/dev/null | head -n1))"
     [ -f "$RAW/container_detail.txt" ] && echo "Container       : $(grep -c '^== ' "$RAW/container_detail.txt" 2>/dev/null || echo 0) aktif (raw/container_detail.txt)"
+    n=$(awk -F'","' 'NR>1 && $3 ~ /^WF-DEPST-0[01]/' "$FINDINGS" | wc -l); [ "$n" -gt 0 ] && awk -F'","' 'NR>1 && $3 ~ /^WF-DEPST-0[01]/{print "Deployment      : " $5 " -> " $6}' "$FINDINGS"
     [ -s "$OUT/.dkrps" ] || [ -n "$CRT_SRC" ] && echo "Akses container : mode=${DKR_MODE:-?} dibaca=${CRT_SRC:-TIDAK BISA} sebagai=${CRT_AS:--} (raw/container_access.txt)"
     echo "Library Java    : $(( $(wc -l < "$OUT/libraries.csv" 2>/dev/null || echo 1) - 1 )) baris inventaris (libraries.csv)"
     [ -f "$RAW/running_apps_other.txt" ] && echo "Aplikasi lain   : $(grep -c '^\[[0-9]*\] PID' "$RAW/running_apps_other.txt" 2>/dev/null | head -n1) non-Java berjalan (raw/running_apps_other.txt)"
@@ -2544,9 +2610,26 @@ build_container_map() {
             print i "\t" $2 "\t" $3 "\t" $4 >> CM; print i "\t" $5 "\t" $6 >> CL}'
     done
   fi
+  [ -s "$OUT/.cmap" ] && ctr_fix_mainpid
   [ -s "$OUT/.cmap" ] && ctr_pid_tree
   [ -n "$CRT_SRC" ] && log "Container: $(wc -l < "$OUT/.cmap") aktif (dibaca: $CRT_SRC, sebagai: $CRT_AS, mode: ${DKR_MODE:-?})"
   return 0
+}
+
+# Pastikan PID utama di peta memang proses container tsb (cocokkan cgroup);
+# bila tidak cocok, pakai PID terkecil yang cgroup-nya memuat id container.
+ctr_fix_mainpid() {
+  local id n i p q tmp="$OUT/.cmap.new"
+  : > "$tmp"
+  while IFS=$'\t' read -r id n i p; do
+    if [ -n "$p" ] && [ "$p" != 0 ] && grep -q "$id" "/proc/$p/cgroup" 2>/dev/null; then :
+    else
+      q=$(grep -l "$id" /proc/[0-9]*/cgroup 2>/dev/null | sed 's#/proc/\([0-9]*\)/cgroup#\1#' | sort -n | head -n1)
+      [ -n "$q" ] && p=$q
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$id" "$n" "$i" "$p" >> "$tmp"
+  done < "$OUT/.cmap"
+  mv "$tmp" "$OUT/.cmap"
 }
 
 # PID utama container + semua turunannya -> id container
@@ -2563,11 +2646,18 @@ ctr_pid_tree() {
 
 # ID container (12 hex) sebuah proses; kosong = proses host
 pid_container() {
-  [ -s "$OUT/.cmap" ] || return 0
   local id
   id=$(grep -oE '[0-9a-f]{64}' "/proc/$1/cgroup" 2>/dev/null | head -n1 | cut -c1-12)
-  if [ -n "$id" ] && grep -q "^$id	" "$OUT/.cmap"; then echo "$id"; return 0; fi
-  [ -s "$OUT/.cpids" ] && awk -F'\t' -v p="$1" '$1==p{print $2; exit}' "$OUT/.cpids"
+  if [ -n "$id" ] && [ -s "$OUT/.cmap" ] && grep -q "^$id	" "$OUT/.cmap"; then echo "$id"; return 0; fi
+  if [ -s "$OUT/.cpids" ]; then
+    local c; c=$(awk -F'\t' -v p="$1" '$1==p{print $2; exit}' "$OUT/.cpids")
+    [ -n "$c" ] && { echo "$c"; return 0; }
+  fi
+  # container yang tidak terdaftar di peta (CLI tidak bisa dipakai): daftarkan dari cgroup
+  if [ -n "$id" ] && grep -qE '(docker|libpod|containerd|crio|kubepods)' "/proc/$1/cgroup" 2>/dev/null; then
+    grep -q "^$id	" "$OUT/.cmap" 2>/dev/null || printf '%s\tctr-%s\t?\t%s\n' "$id" "$id" "$1" >> "$OUT/.cmap"
+    echo "$id"
+  fi
   return 0
 }
 
@@ -3384,6 +3474,8 @@ PYEOF
 check_container_java() {
   local pid="$1" cid name root cmd exe jh jar cwd label user jv cfg base x
   cid=$(pid_container "$pid"); name=$(ctr_name "$cid"); root=$(ctr_root "$cid")
+  [ -z "$name" ] && name="ctr-$cid"
+  if [ -z "${ASSESS_TEST_CTR_ROOT:-}" ] && { [ -z "$root" ] || [ ! -d "$root/" ]; }; then root="/proc/$pid/root"; fi
   cmd=$(pid_cmd "$pid"); exe=$(readlink "/proc/$pid/exe" 2>/dev/null); exe=${exe% (deleted)}
   cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null); user=$(pid_user "$pid")
   label="container:$name"
@@ -3406,7 +3498,11 @@ check_container_java() {
     "Aktifkan jmxremote.authenticate=true + SSL, atau jangan publikasikan port JMX."
   echo "$cmd" | grep -qE 'jdwp|-Xdebug|-Xrunjdwp' && finding HIGH JAVA-DEBUG-01 Container "Remote debug (JDWP) aktif di dalam container" "$label (PID $pid)" \
     "Hapus opsi -agentlib:jdwp/-Xdebug dari perintah start image."
-  [ -n "$root" ] && [ -d "$root" ] || return 0
+  if [ ! -r "$root/" ] || [ -z "$(ls "$root/" 2>/dev/null)" ]; then
+    finding HIGH CNT-FS-02 Container "Isi container tidak bisa dibaca dari host: library aplikasi di container ini TIDAK diperiksa" "$label (PID $pid, rootfs $root)" \
+      "Jalankan ulang: sudo bash assess.sh --docker-user <user pemilik docker>. Bila tetap muncul, kirim hasil: ls -la /proc/$pid/root/"
+    return 0
+  fi
   case "$cmd" in
     *jboss-modules.jar*|*jboss.home.dir*)
       jh=$(arg_val "$pid" "-Djboss.home.dir"); base=$(arg_val "$pid" "-Djboss.server.base.dir"); [ -z "$base" ] && base="$jh/standalone"
