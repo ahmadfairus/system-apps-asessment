@@ -1,4 +1,4 @@
-# Panduan: assess.sh v4.1 + Trivy di Kali
+# Panduan: assess.sh v4.2 + Trivy di Kali
 
 Alur: server (offline) → salin manual → Kali (ada internet) → unggah dua file hasil ke chat Claude.
 
@@ -61,7 +61,13 @@ ls ~/.cache/trivy/db/trivy.db ~/.cache/trivy/java-db/trivy-java.db   # keduanya 
 sudo bash assess.sh
 ```
 
-Tidak perlu parameter. Docker rootless (daemon milik user aplikasi, mis. `application`) dikenali otomatis. Di akhir tercetak dua baris; catat keduanya:
+Tidak perlu parameter. Docker rootless (daemon milik user aplikasi, mis. `application`) dikenali otomatis.
+
+Khusus server yang Docker-nya hanya bisa dijalankan oleh user `application`, pakai:
+
+```bash
+sudo bash assess.sh --docker-user application
+``` Di akhir tercetak dua baris; catat keduanya:
 
 ```
 RESULT: /tmp/assess-<host>-<waktu>.tar.gz
@@ -117,6 +123,16 @@ Unggah dua file teks ini ke chat:
 | `BACA-SAYA.txt` | Penjelasan singkat isi arsip |
 | `SHA256SUMS` | Sidik jari tiap file di dalam arsip |
 
+## Temuan penting untuk dicek pertama
+
+| Kode | Arti |
+|---|---|
+| `WF-DEPST-00` | WildFly berjalan tanpa aplikasi ter-deploy: yang dinilai baru platform |
+| `WF-DEPST-01` | Daftar aplikasi yang ter-deploy + context web-nya |
+| `WF-DEPST-02` | Ada deployment yang gagal |
+| `CNT-FS-02` | Isi container tidak terbaca: library di container itu TIDAK diperiksa |
+| `DKR-NOACCESS-01` | Docker tidak bisa ditanya: jalankan ulang dengan `--docker-user` |
+
 ## Batasan yang perlu diketahui
 
 - Library Java tanpa `groupId` (versi hanya terbaca dari nama file) tidak bisa dicocokkan Trivy. Jumlahnya tertulis di `sbom/RINGKASAN.txt`; library ini dinilai dari `.txt`.
@@ -124,4 +140,6 @@ Unggah dua file teks ini ke chat:
 - Image yang tersimpan tetapi tidak berjalan hanya didaftar (`CNT-IDLE-01`), isinya tidak dipindai.
 - Bila perintah Docker tidak bisa dipakai sama sekali, container dibaca dari file di disk (`DKR-FSONLY-01`); image dan riwayat build tidak diperiksa.
 - Biner Go/native hanya ditandai (`APP-UNK-01`), library di dalamnya tidak terbaca.
+- Symlink absolut di dalam container tidak diikuti (jarang terjadi pada image WildFly/Java).
+- Dockerfile belum dibandingkan dengan isi container yang berjalan.
 - Kubernetes belum dicakup.
