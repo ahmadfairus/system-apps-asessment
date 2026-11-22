@@ -47,7 +47,7 @@
 set -u
 umask 077
 
-SCRIPT_VERSION="4.2"
+SCRIPT_VERSION="4.4"
 OUTBASE="/tmp"
 SKIP_FS=0
 NO_NET=0
@@ -1043,7 +1043,7 @@ scan_disk_archives_only() {
   local mp
   log "Mencari semua arsip Java (jar/war/ear) di seluruh disk lokal"
   for mp in $(df -lP -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1{print $6}'); do
-    timeout 1200 find "$mp" -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /var/lib/docker -o -path /var/lib/containers -o -path /var/lib/containerd \) -prune -o \
+    timeout 1200 find "$mp" -xdev \( "${PRUNE_EXPR[@]}" \) -prune -o \
       -type f \( \( \( -iname '*.jar' -o -iname '*.war' -o -iname '*.ear' -o -iname '*.rar' \) -printf 'AR %p\n' \) , \
                   \( \( -name package-lock.json -o -name yarn.lock -o -name composer.lock -o -name requirements.txt \) -printf 'MF %p\n' \) , \
                   \( \( -name Dockerfile -o -name 'Dockerfile.*' -o -name '*.dockerfile' -o -name Containerfile -o -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' -o -name compose.yml -o -name compose.yaml \) -printf 'DF %p\n' \) , \
@@ -1105,7 +1105,7 @@ check_fs() {
   local mp n tmp="$OUT/.fs.$$"
   : > "$tmp"
   for mp in $(df -lP -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1{print $6}'); do
-    timeout 1200 find "$mp" -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /var/lib/docker -o -path /var/lib/containers -o -path /var/lib/containerd \) -prune -o \
+    timeout 1200 find "$mp" -xdev \( "${PRUNE_EXPR[@]}" \) -prune -o \
       \( -type f \( \
            \( \( -iname '*.jar' -o -iname '*.war' -o -iname '*.ear' -o -iname '*.rar' \) -printf 'AR %p\n' \) , \
            \( -path '*/bin/java' -printf 'JV %p\n' \) , \
@@ -1126,7 +1126,7 @@ check_fs() {
   grep '^JV ' "$tmp" | cut -c4- | sort -u > "$OUT/.javabins"
   grep '^MF ' "$tmp" | cut -c4- | sort -u > "$OUT/.manifests"
   grep '^DF ' "$tmp" | cut -c4- | sort -u > "$OUT/.cfgfiles"
-  grep '^KR ' "$tmp" | cut -c4- | grep -vE '^/(usr/share|usr/lib|etc/pki/(ca-trust|java)|etc/ssl/certs)/' | sort -u > "$RAW/fs_key_readable.txt"
+  grep '^KR ' "$tmp" | cut -c4- | grep -vE '^/(usr/share|usr/lib|etc/pki/(ca-trust|java)|etc/ssl/certs)/|^/etc/trusted-key\.key$' | sort -u > "$RAW/fs_key_readable.txt"
   grep '^WD ' "$tmp" | cut -c4- | sort -u > "$RAW/fs_ww_dirs_nosticky.txt"
   rm -f "$tmp"
   n=$(wc -l < "$RAW/fs_key_readable.txt")
@@ -2036,7 +2036,7 @@ check_containers() {
   else
     if [ "$CRT_SRC" = cli ]; then "${CRT_CMD[@]}" inspect $running > "$insp" 2>/dev/null
     else cp "$OUT/.cinsp_fs.json" "$insp" 2>/dev/null; fi
-    "$PY" - "$insp" "$CRT" "$merged" "$det" "${DKR_MODE:-}" <<'PYEOF' | while IFS=$'\t' read -r sev id title ev rec; do
+    "$PY" - "$insp" "$CRT" "$merged" "$det" "${DKR_MODE:-}" "$OUT/.cbinds" <<'PYEOF' | while IFS=$'\t' read -r sev id title ev rec; do
 from __future__ import print_function
 import sys, json, io, re
 try:
@@ -2069,6 +2069,22 @@ for c in data:
     for b in binds: msrc.add(b.split(':')[0])
     for m in mounts:
         if m.get('Source'): msrc.add(m['Source'])
+    if len(sys.argv) > 6:
+        try:
+            bl = set()
+            for m in mounts:
+                if m.get('Source', '').startswith('/') and m.get('Destination') and m.get('Type', 'bind') == 'bind':
+                    bl.add((m['Source'], m['Destination']))
+            for b in binds:
+                pp = b.split(':')
+                if len(pp) >= 2 and pp[0].startswith('/'): bl.add((pp[0], pp[1]))
+            bf = open(sys.argv[6], 'ab')
+            for a, d in sorted(bl):
+                ln = u'%s\t%s\t%s\n' % (name, a, d)
+                bf.write(ln.encode('utf-8') if not isinstance(ln, bytes) else ln)
+            bf.close()
+        except Exception:
+            pass
     for s in msrc:
         if s.rstrip('/').endswith('docker.sock'):
             if RL:
@@ -2659,6 +2675,117 @@ pid_container() {
     echo "$id"
   fi
   return 0
+}
+
+#------------------------------------------------------------------------------
+# FOLDER DATA CONTAINER (dikecualikan dari scan disk, diperiksa izinnya)
+#------------------------------------------------------------------------------
+PRUNE_EXPR=(-path /proc -o -path /sys -o -path /dev -o -path /run -o -path /var/lib/docker -o -path /var/lib/containers -o -path /var/lib/containerd)
+
+ctr_storage_dirs() {
+  local u h r
+  {
+    echo /var/lib/docker; echo /var/lib/containers; echo /var/lib/containerd
+    sed -n 's/.*"\(data-root\|graph\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\2/p' /etc/docker/daemon.json 2>/dev/null
+    grep -oE -- '--(data-root|graph)[= ][^ ]+' "$OUT/.dkrps" 2>/dev/null | sed -E 's/^--(data-root|graph)[= ]//'
+    if [ "$CRT_SRC" = cli ] && [ "$CRT_BIN" = docker ]; then timeout 20 "${CRT_CMD[@]}" info --format '{{.DockerRootDir}}' 2>/dev/null; fi
+    for u in $( { echo "$CRT_AS"; echo "$DOCKER_USER"; dkr_candidate_users; } | grep -vE ' |^$|^root$' | awk '!s[$0]++'); do
+      h=$(getent passwd "$u" | cut -d: -f6); [ -n "$h" ] || continue
+      echo "$h/.local/share/docker"; echo "$h/.local/share/containers"
+      sed -n 's/.*"\(data-root\|graph\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\2/p' "$h/.config/docker/daemon.json" 2>/dev/null
+    done
+  } | sed 's#/*$##' | grep '^/' | awk '!s[$0]++' | while read -r r; do [ -d "$r" ] && rpath "$r"; done | awk '!s[$0]++'
+}
+
+build_prune_expr() {
+  local d
+  ctr_storage_dirs > "$RAW/container_storage_dirs.txt" 2>/dev/null
+  while read -r d; do
+    [ -n "$d" ] || continue
+    case " ${PRUNE_EXPR[*]} " in *" $d "*) continue ;; esac
+    PRUNE_EXPR+=(-o -path "$d")
+  done < "$RAW/container_storage_dirs.txt"
+  [ -s "$RAW/container_storage_dirs.txt" ] && log "Folder data container (tidak ikut scan disk): $(tr '\n' ' ' < "$RAW/container_storage_dirs.txt")"
+  return 0
+}
+
+# File di folder host yang di-bind mount ke container dan sedang dipakai container
+# -> tandai sebagai "berjalan" (bukan aset host yang menganggur)
+ctr_bind_running() {
+  [ -s "$OUT/.cbinds" ] || return 0
+  sort -u "$OUT/.cbinds" -o "$OUT/.cbinds"
+  { echo "Bind mount container (container <TAB> path host <TAB> path di container):"; cat "$OUT/.cbinds"; } > "$RAW/container_binds.txt"
+  [ -s "$OUT/.running" ] || return 0
+  local name src dst id pids
+  while IFS=$'\t' read -r name src dst; do
+    id=$(awk -F'\t' -v n="$name" '$2==n{print $1; exit}' "$OUT/.cmap" 2>/dev/null)
+    [ -n "$id" ] || continue
+    pids=$( { awk -F'\t' -v i="$id" '$1==i{print $4}' "$OUT/.cmap"
+              awk -F'\t' -v i="$id" '$2==i{print $1}' "$OUT/.cpids" 2>/dev/null
+              grep -l "$id" /proc/[0-9]*/cgroup 2>/dev/null | sed 's#/proc/\([0-9]*\)/cgroup#\1#'; } | sort -u | tr '\n' ' ')
+    awk -v pids=" $pids " -v src="${src%/}" -v dst="${dst%/}" '
+      match($0, /^\/proc\/[0-9]+\/root/) {
+        p = substr($0, 7, RLENGTH - 11); rest = substr($0, RLENGTH + 1)
+        if (index(pids, " " p " ") && (rest == dst || index(rest, dst "/") == 1)) print src substr(rest, length(dst) + 1)
+      }' "$OUT/.running"
+  done < "$OUT/.cbinds" > "$OUT/.running.bind"
+  if [ -s "$OUT/.running.bind" ]; then
+    cat "$OUT/.running.bind" >> "$OUT/.running"
+    log "Bind mount: $(wc -l < "$OUT/.running.bind") path host ditandai dipakai container"
+  fi
+  rm -f "$OUT/.running.bind"
+}
+
+# Izin & opsi mount folder data container dan sumber bind mount
+check_container_storage() {
+  [ -s "$RAW/container_storage_dirs.txt" ] || [ -s "$OUT/.cbinds" ] || return 0
+  log "Cek izin dan opsi mount folder data container / bind mount"
+  local f="$RAW/container_storage.txt" d mode own grp opts tgt miss nomnt="" ww name
+  : > "$f"
+  while read -r d; do
+    [ -d "$d" ] || continue
+    mode=$(stat -c %a "$d"); own=$(stat -c %U "$d"); grp=$(stat -c %G "$d")
+    echo "DATA  $d mode=$mode owner=$own:$grp mount=$(findmnt -n -T "$d" -o TARGET,OPTIONS 2>/dev/null | tr -s ' ')" >> "$f"
+    case "$mode" in
+      *[2367]) finding HIGH DKR-DATA-01 Container "Folder data container bisa ditulis semua user" "$d mode $mode ($own:$grp)" \
+                 "chmod o-rwx $d. Folder ini berisi filesystem semua container dan image." ;;
+      *[45])   finding MEDIUM DKR-DATA-02 Container "Folder data container bisa dibaca user lain" "$d mode $mode ($own:$grp)" \
+                 "chmod o-rwx $d (Docker memakai 710). Isinya memuat filesystem container, termasuk konfigurasi dan secret aplikasi." ;;
+    esac
+  done < "$RAW/container_storage_dirs.txt"
+
+  # sumber bind mount: siapa yang bisa mengubah isinya
+  if [ -s "$OUT/.cbinds" ]; then
+    cut -f2 "$OUT/.cbinds" | sort -u | while read -r d; do
+      [ -e "$d" ] || continue
+      [ -S "$d" ] && continue
+      case "$d" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run/*) continue ;; esac
+      name=$(awk -F'\t' -v s="$d" '$2==s{print $1}' "$OUT/.cbinds" | sort -u | tr '\n' ',' | sed 's/,$//')
+      mode=$(stat -c %a "$d"); own=$(stat -c %U "$d"); grp=$(stat -c %G "$d")
+      echo "BIND  $d mode=$mode owner=$own:$grp container=$name mount=$(findmnt -n -T "$d" -o TARGET,OPTIONS 2>/dev/null | tr -s ' ')" >> "$f"
+      ww=$(find "$d" -xdev -maxdepth 4 -perm -0002 ! -type l 2>/dev/null | head -n 5 | tr '\n' ' ')
+      if [ -n "$ww" ]; then
+        finding HIGH DKR-BIND-01 Container "Isi bind mount container bisa diubah semua user" "container $name: $ww" \
+          "chmod -R o-w $d. Isi folder ini dipakai container; siapa pun yang bisa menulis bisa mengganti kode/konfigurasi aplikasi."
+      fi
+    done
+  fi
+
+  # opsi mount nosuid,nodev untuk folder data & bind mount
+  { cat "$RAW/container_storage_dirs.txt"; cut -f2 "$OUT/.cbinds" 2>/dev/null; } | sort -u | while read -r d; do
+    [ -d "$d" ] || continue
+    case "$d" in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run/*) continue ;; esac
+    opts=$(findmnt -n -T "$d" -o OPTIONS 2>/dev/null); tgt=$(findmnt -n -T "$d" -o TARGET 2>/dev/null)
+    miss=""
+    case ",$opts," in *,nosuid,*) ;; *) miss="$miss nosuid" ;; esac
+    case ",$opts," in *,nodev,*) ;; *) miss="$miss nodev" ;; esac
+    [ -n "$miss" ] && echo "$d (mount $tgt, tanpa$miss)"
+  done > "$OUT/.nomnt"
+  if [ -s "$OUT/.nomnt" ]; then
+    finding LOW DKR-MNT-01 Container "Folder data/bind mount container tidak di-mount dengan nosuid,nodev" "$(head -n 6 "$OUT/.nomnt" | tr '\n' ';')" \
+      "UAT (/data folder di partisi /): bind mount /data ke dirinya sendiri dengan nosuid,nodev di /etc/fstab. Produksi: partisi/LV /data dengan opsi nosuid,nodev. Cek: findmnt -T /data"
+  fi
+  rm -f "$OUT/.nomnt"
 }
 
 #------------------------------------------------------------------------------
@@ -3650,7 +3777,7 @@ check_ioc() {
 
   # 2. File tersembunyi di folder sementara (alat/skrip penyerang biasa ditaruh di sini)
   find /tmp /var/tmp /dev/shm -xdev -maxdepth 3 -type f -name '.*' 2>/dev/null \
-    | grep -vE '/\.(X11-unix|ICE-unix|font-unix|XIM-unix|Test-unix)/|/\.(s\.PGSQL|java_pid|com_ibm|lock|X[0-9]+-lock)|/hsperfdata_' > "$OUT/.hid"
+    | grep -vE '/\.(X11-unix|ICE-unix|font-unix|XIM-unix|Test-unix)/|/\.(s\.PGSQL|java_pid|com_ibm|lock|X[0-9]+-lock)|/hsperfdata_' | grep -vF -- "$OUT/" > "$OUT/.hid"
   n=$(wc -l < "$OUT/.hid")
   if [ "$n" -gt 0 ]; then
     while read -r f; do echo "HIDDEN: $(stat -c '%U %a %s byte ubah=%y' "$f" 2>/dev/null | cut -c1-70) $f"; done < "$OUT/.hid" >> "$list"
@@ -3837,6 +3964,7 @@ main() {
   [ "$SAFE" -eq 1 ] && log "Mode --safe: tanpa scan filesystem, tanpa request jaringan lokal, tanpa inventaris modules WildFly"
   echo 'host,category,check_id,severity,title,evidence,recommendation' > "$FINDINGS"
   build_container_map
+  build_prune_expr
   check_os
   check_ssh
   check_accounts
@@ -3854,6 +3982,8 @@ main() {
   collect_container_configs
   check_idle_images
   check_ioc
+  ctr_bind_running
+  check_container_storage
   run_lib_inventory
   check_lib_baseline
   build_inventory_and_sbom
