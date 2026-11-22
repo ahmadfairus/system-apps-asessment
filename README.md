@@ -1,4 +1,4 @@
-# Panduan: assess.sh v4.2 + Trivy di Kali
+# Panduan: assess.sh v4.4 + Trivy di Kali
 
 Alur: server (offline) → salin manual → Kali (ada internet) → unggah dua file hasil ke chat Claude.
 
@@ -132,6 +132,16 @@ Unggah dua file teks ini ke chat:
 | `WF-DEPST-02` | Ada deployment yang gagal |
 | `CNT-FS-02` | Isi container tidak terbaca: library di container itu TIDAK diperiksa |
 | `DKR-NOACCESS-01` | Docker tidak bisa ditanya: jalankan ulang dengan `--docker-user` |
+| `DKR-DATA-01/02` | Folder data Docker (mis. `/data/docker`) bisa ditulis/dibaca user lain |
+| `DKR-BIND-01` | Isi bind mount (mis. `/data/apps`) bisa diubah semua user |
+| `DKR-MNT-01` | Folder data/bind mount tanpa opsi `nosuid,nodev` |
+
+## Yang dikenali otomatis
+
+- OS: Rocky Linux 9/10 (juga CentOS/RHEL 7). Trivy mendukung Rocky 8, 9, dan 10.
+- Docker rootless milik user aplikasi, socket `/run/user/<uid>/docker.sock`.
+- Data-root Docker di luar lokasi bawaan (mis. `/data/docker`): tidak ikut scan disk agar tidak terbaca ganda.
+- File di folder bind mount (mis. `/data/apps`) yang dipakai container ditandai *berjalan*, bukan aset host yang menganggur.
 
 ## Batasan yang perlu diketahui
 
