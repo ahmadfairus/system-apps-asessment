@@ -47,7 +47,7 @@
 set -u
 umask 077
 
-SCRIPT_VERSION="4.4"
+SCRIPT_VERSION="4.6"
 OUTBASE="/tmp"
 SKIP_FS=0
 NO_NET=0
@@ -559,7 +559,7 @@ try:
     import time, stat
     RANKS = {'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'INFO': 0}
     SECRET_KEY = re.compile(r'^\s*[A-Za-z0-9_.-]*(password|passwd|pwd|secret|token|api[-_.]?key|private[-_.]?key|credential)[A-Za-z0-9_.-]*\s*[=:]\s*(\S+)', re.I | re.M)
-    NOT_SECRET_KEY = re.compile(r'(restriction|policy|checker|forbidden|min|max|length|expir|valid|encoder|algorithm|class|enabled|file|path|url|uri|header|param|name|mode|type|realm|regex|pattern)', re.I)
+    NOT_SECRET_KEY = re.compile(r'(restriction|strength|policy|checker|forbidden|min|max|length|expir|valid|encoder|algorithm|class|enabled|file|path|url|uri|header|param|name|mode|type|realm|regex|pattern)', re.I)
     def secret_keys(text):
         ks = set()
         for m in SECRET_KEY.finditer(text):
@@ -567,6 +567,10 @@ try:
             val = m.group(2).strip('"\'')
             last = key.lower().replace('-', '.').replace('_', '.').split('.')[-1]
             if NOT_SECRET_KEY.search(last) and not re.search(r'(password|secret|token|key)$', last): continue
+            # bagian nama SETELAH kata secret menunjukkan pengaturan, bukan nilai rahasia
+            # (mis. password.restriction.strength, password-file, token.expiry)
+            mw = re.search(r'(password|passwd|pwd|secret|token|api[-_.]?key|private[-_.]?key|credential)', key.lower())
+            if mw and NOT_SECRET_KEY.search(key.lower()[mw.end():]): continue
             if not val or val.startswith(('${', 'ENC(', '/', 'classpath:', 'file:', 'http')) or val.lower() in ('null', 'true', 'false', '""', "''", 'none', 'changeit'):
                 continue
             ks.add(key)
@@ -3491,6 +3495,66 @@ with io.open(os.path.join(OUT, 'os_packages.csv'), 'w', encoding='utf-8') as f:
     f.write('host,scope,os,os_version,type,name,version,arch\n')
     for r in ospk_rows: f.write(','.join(q(x) for x in r) + '\n')
 
+# ---------------------------------------------------------------- groupId untuk library umum
+# Banyak jar (Spring, Tomcat, POI, ...) tidak menyimpan pom.properties sehingga groupId
+# tidak terbaca. Tanpa groupId Trivy melewati library itu. Tabel ini hanya berisi nama
+# artifact yang groupId-nya pasti di Maven Central; nama lain tetap dibiarkan kosong.
+SPRING_FW = set('spring-aop spring-aspects spring-beans spring-context spring-context-indexer spring-context-support '
+                'spring-core spring-expression spring-instrument spring-jcl spring-jdbc spring-jms spring-messaging '
+                'spring-orm spring-oxm spring-r2dbc spring-test spring-tx spring-web spring-webflux spring-webmvc '
+                'spring-websocket'.split())
+EXACT_GROUP = {
+    'tomcat-annotations-api': 'org.apache.tomcat', 'tomcat-jdbc': 'org.apache.tomcat', 'tomcat-juli': 'org.apache.tomcat',
+    'thymeleaf': 'org.thymeleaf', 'thymeleaf-spring5': 'org.thymeleaf', 'thymeleaf-spring6': 'org.thymeleaf',
+    'attoparser': 'org.attoparser', 'unbescape': 'org.unbescape',
+    'poi': 'org.apache.poi', 'poi-ooxml': 'org.apache.poi', 'poi-ooxml-schemas': 'org.apache.poi',
+    'poi-ooxml-lite': 'org.apache.poi', 'poi-ooxml-full': 'org.apache.poi', 'poi-scratchpad': 'org.apache.poi',
+    'xmlbeans': 'org.apache.xmlbeans',
+    'commons-collections': 'commons-collections', 'commons-httpclient': 'commons-httpclient',
+    'commons-logging': 'commons-logging', 'commons-io': 'commons-io', 'commons-lang': 'commons-lang',
+    'commons-codec': 'commons-codec', 'commons-beanutils': 'commons-beanutils', 'commons-fileupload': 'commons-fileupload',
+    'commons-collections4': 'org.apache.commons', 'commons-lang3': 'org.apache.commons', 'commons-text': 'org.apache.commons',
+    'commons-compress': 'org.apache.commons', 'commons-configuration2': 'org.apache.commons', 'commons-pool2': 'org.apache.commons',
+    'commons-dbcp2': 'org.apache.commons', 'commons-csv': 'org.apache.commons', 'commons-math3': 'org.apache.commons',
+    'velocity': 'org.apache.velocity', 'velocity-engine-core': 'org.apache.velocity',
+    'freemarker': 'org.freemarker', 'gson': 'com.google.code.gson', 'guava': 'com.google.guava',
+    'jasypt': 'org.jasypt', 'oro': 'oro', 'jcommander': 'com.beust', 'lombok': 'org.projectlombok',
+    'reactor-core': 'io.projectreactor', 'reactive-streams': 'org.reactivestreams',
+    'caffeine': 'com.github.ben-manes.caffeine', 'jspecify': 'org.jspecify', 'HikariCP': 'com.zaxxer',
+    'snakeyaml': 'org.yaml', 'log4j': 'log4j', 'mariadb-java-client': 'org.mariadb.jdbc', 'postgresql': 'org.postgresql',
+    'mysql-connector-java': 'mysql', 'h2': 'com.h2database', 'primefaces': 'org.primefaces',
+    'primefaces-extensions': 'org.primefaces.extensions', 'mybatis': 'org.mybatis', 'mybatis-spring': 'org.mybatis',
+    'ognl': 'ognl', 'javassist': 'org.javassist', 'jsoup': 'org.jsoup',
+    'kafka-clients': 'org.apache.kafka', 'jna': 'net.java.dev.jna', 'jna-platform': 'net.java.dev.jna',
+    'libthrift': 'org.apache.thrift', 'checker-qual': 'org.checkerframework', 'antlr': 'antlr',
+}
+PREFIX_GROUP = [
+    ('spring-boot', 'org.springframework.boot'), ('spring-security-', 'org.springframework.security'),
+    ('spring-data-', 'org.springframework.data'), ('spring-session-', 'org.springframework.session'),
+    ('spring-ws-', 'org.springframework.ws'), ('spring-cloud-', 'org.springframework.cloud'),
+    ('spring-batch-', 'org.springframework.batch'), ('spring-integration-', 'org.springframework.integration'),
+    ('tomcat-embed-', 'org.apache.tomcat.embed'), ('thymeleaf-extras-', 'org.thymeleaf.extras'),
+    ('reactor-netty', 'io.projectreactor.netty'), ('micrometer-', 'io.micrometer'),
+    ('bcprov-', 'org.bouncycastle'), ('bcpkix-', 'org.bouncycastle'), ('bcutil-', 'org.bouncycastle'),
+    ('log4j-', 'org.apache.logging.log4j'), ('slf4j-', 'org.slf4j'), ('logback-', 'ch.qos.logback'),
+    ('netty-', 'io.netty'), ('bcmail-', 'org.bouncycastle'), ('bcpg-', 'org.bouncycastle'), ('bcjmail-', 'org.bouncycastle'),
+    ('grpc-', 'io.grpc'), ('lucene-', 'org.apache.lucene'), ('opentelemetry-', 'io.opentelemetry'),
+    ('elasticsearch-rest-client', 'org.elasticsearch.client'), ('jaeger-', 'io.jaegertracing'),
+]
+def guess_group(a, v):
+    if a in SPRING_FW: return 'org.springframework'
+    if a in EXACT_GROUP: return EXACT_GROUP[a]
+    major = re.match(r'(\d+)', v or '')
+    major = int(major.group(1)) if major else -1
+    if a in ('jackson-databind', 'jackson-core', 'jackson-annotations') and major == 2: return 'com.fasterxml.jackson.core'
+    if a == 'ehcache': return 'org.ehcache' if major >= 3 else 'net.sf.ehcache'
+    if a == 'hibernate-core': return 'org.hibernate.orm' if major >= 6 else 'org.hibernate'
+    if a in ('asm', 'asm-util', 'asm-tree', 'asm-commons', 'asm-analysis') and major >= 4: return 'org.ow2.asm'
+    if a == 'dom4j': return 'org.dom4j' if major >= 2 else 'dom4j'
+    for pre, g in PREFIX_GROUP:
+        if a.startswith(pre): return g
+    return ''
+
 # ---------------------------------------------------------------- library Java -> komponen
 hdr = None
 for row in csv_rows(os.path.join(OUT, 'libraries.csv')):
@@ -3504,12 +3568,17 @@ for row in csv_rows(os.path.join(OUT, 'libraries.csv')):
     sc = S(scope)
     loc = arch + ('!/' + r['path_in_archive'] if r.get('path_in_archive') else '')
     g, a, v = r.get('group_id', ''), r['artifact_id'], r['version']
+    gsrc = 'jar'
+    if not g:
+        g = guess_group(a, v); gsrc = 'tebakan-nama-artifact'
+        if g: sc['guessed'] = sc.get('guessed', 0) + 1
     if not g:
         sc['nopurl'] += 1
         sc['libs'].append({'name': a, 'version': v, 'purl': None, 'group': '', 'props': [('FilePath', loc), ('PkgType', 'jar')], 'eco': 'maven'})
         continue
+    lp = [('FilePath', loc), ('PkgType', 'jar')]
     sc['libs'].append({'name': a, 'group': g, 'version': v, 'purl': 'pkg:maven/%s/%s@%s' % (enc(g), enc(a), enc(v, '+')),
-                       'props': [('FilePath', loc), ('PkgType', 'jar')], 'eco': 'maven'})
+                       'props': lp, 'eco': 'maven', 'gsrc': gsrc})
 for o in rows_other:
     sc = S(o['scope'])
     name, v = o['name'], o['version']
@@ -3564,6 +3633,8 @@ for scope in sorted(scopes):
              'type': 'library', 'name': l['name'], 'version': l['version'], 'properties': [prop(k, v) for k, v in l['props']]}
         if l.get('group'): c['group'] = l['group']
         if l.get('purl'): c['purl'] = l['purl']
+        if l.get('gsrc') == 'tebakan-nama-artifact':
+            c['properties'].append({'name': 'assess:groupIdSource', 'value': 'tebakan-nama-artifact'})
         comps.append(c)
     nlib = len(seenl)
     bom = {'bomFormat': 'CycloneDX', 'specVersion': '1.5', 'version': 1, 'serialNumber': 'urn:uuid:' + str(uuid.uuid4()),
@@ -3574,8 +3645,8 @@ for scope in sorted(scopes):
            'components': comps, 'dependencies': deps}
     fname = 'host.cdx.json' if scope == 'host' else 'container-%s.cdx.json' % re.sub(r'[^A-Za-z0-9._-]', '_', scope.split(':', 1)[1])
     wjson(os.path.join(OUT, 'sbom', fname), bom)
-    summary.append('%-34s OS=%s %s | paket OS: %d | library: %d (tanpa groupId, tidak bisa dicocokkan Trivy: %d)' % (
-        fname, oid or '?', over, len(sc['pkgs']), nlib, sc['nopurl']))
+    summary.append('%-34s OS=%s %s | paket OS: %d | library: %d (groupId ditebak dari nama: %d; tanpa groupId, tidak bisa dicocokkan Trivy: %d)' % (
+        fname, oid or '?', over, len(sc['pkgs']), nlib, sc.get('guessed', 0), sc['nopurl']))
     if sc['pkgs'] and not oid:
         emit(','.join(q(x) for x in [HOST, 'SBOM', 'SBOM-OS-01', 'INFO', 'Jenis OS tidak dikenali, paket OS tidak masuk SBOM', scope, 'Periksa /etc/os-release pada lingkup ini.']))
 with io.open(os.path.join(OUT, 'sbom', 'RINGKASAN.txt'), 'w', encoding='utf-8') as f:
@@ -3584,8 +3655,12 @@ with io.open(os.path.join(OUT, 'sbom', 'RINGKASAN.txt'), 'w', encoding='utf-8') 
 tot_nop = sum(sc['nopurl'] for sc in scopes.values())
 emit(','.join(q(x) for x in [HOST, 'SBOM', 'SBOM-01', 'INFO', '%d file SBOM dibuat (folder sbom/)' % len(summary),
       ' ; '.join(s.split(' OS=')[0].strip() for s in summary), 'Pindai tiap file dengan: trivy sbom --skip-db-update --offline-scan <file>']))
+tot_guess = sum(sc.get('guessed', 0) for sc in scopes.values())
+if tot_guess:
+    emit(','.join(q(x) for x in [HOST, 'SBOM', 'SBOM-03', 'INFO', '%d library Java diberi groupId dari nama artifact (mis. Spring, Tomcat, POI)' % tot_guess,
+          'ditandai assess:groupIdSource=tebakan-nama-artifact di SBOM', 'Library ini sekarang ikut dicek Trivy. Bila ada hasil yang janggal, cocokkan groupId-nya dengan isi jar.']))
 if tot_nop:
-    emit(','.join(q(x) for x in [HOST, 'SBOM', 'SBOM-02', 'INFO', '%d library Java tanpa groupId (versi hanya dari nama file/manifest)' % tot_nop,
+    emit(','.join(q(x) for x in [HOST, 'SBOM', 'SBOM-02', 'INFO', '%d library Java tanpa groupId dan tidak dikenali (mis. library internal)' % tot_nop,
           'lihat libraries.csv kolom version_source', 'Library ini tidak bisa dicocokkan Trivy lewat SBOM; dinilai manual dari inventaris.']))
 warn('SBOM: %d file, %d library non-Java, %d paket OS' % (len(summary), len(rows_other), len(ospk_rows)))
 PYEOF
