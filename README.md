@@ -1,4 +1,4 @@
-# Panduan: assess.sh v4.4 + Trivy di Kali
+# Panduan: assess.sh v4.7 + Trivy di Kali
 
 Alur: server (offline) → salin manual → Kali (ada internet) → unggah dua file hasil ke chat Claude.
 
@@ -127,6 +127,9 @@ Unggah dua file teks ini ke chat:
 
 | Kode | Arti |
 |---|---|
+| `WEB-PROXY-BYPASS-01` | Path yang di-whitelist IP di reverse proxy bisa dicapai lewat path publik lain (prefix ProxyPass), termasuk lintas vhost |
+| `IOC-WEB-01` | Pola serangan berisiko tinggi di access log yang dijawab 2xx: wajib diinvestigasi (rincian di `raw/web_log_ioc.txt`) |
+| `WEB-VER-02` | Apache hasil kompilasi sendiri di bawah versi aman (`APACHE_MIN` di awal script) |
 | `WF-DEPST-00` | WildFly berjalan tanpa aplikasi ter-deploy: yang dinilai baru platform |
 | `WF-DEPST-01` | Daftar aplikasi yang ter-deploy + context web-nya |
 | `WF-DEPST-02` | Ada deployment yang gagal |
@@ -138,6 +141,13 @@ Unggah dua file teks ini ke chat:
 
 ## Yang dikenali otomatis
 
+- **Web server (baru di v4.7):** semua file config Apache yang benar-benar dimuat, di folder sedalam apa pun (`httpd -t -D DUMP_INCLUDES`, dengan cadangan penelusuran `Include`/`IncludeOptional`). Termasuk beberapa instance httpd dengan `-f`/`-d` custom, ServerRoot di luar lokasi bawaan (mis. `/usr/local/apache2`), dan `.htaccess` di DocumentRoot. Nginx dibaca lewat `nginx -T`, termasuk instance dengan `-c` custom.
+  - `raw/httpd_config_full.txt`: isi config lengkap dengan nomor baris dan komentar (secret disamarkan).
+  - `raw/web_proxy_analysis.txt`: peta path depan → backend → status akses (PUBLIK/DIBATASI).
+- **Lokasi log (baru di v4.7):** log web (termasuk lewat `rotatelogs`/pipe) dan log aplikasi Java (logback/log4j2, `logging.file.*`, WildFly `standalone/log`, Tomcat `logs/`). Untuk tiap lokasi: izin file, kapasitas disk, jumlah, dan umur file, ditulis di `raw/log_locations.txt`.
+- **Jejak serangan di access log (baru di v4.7):** file 8 hari terakhir, maks 40 MB terakhir per file (5 MB pada `--safe`): log4shell, traversal, webshell, SQLi, file sensitif, konsol admin, tool scanner. Hasilnya di `raw/web_log_ioc.txt`, ditambah top IP.
+- **Jar backup dengan nama tidak standar (baru di v4.7):** `*.jar_bk`, `*.jar.bak`, `*.jar__backup`, `*.war.20261127`. Hanya diambil bila memang file zip, dan masuk kategori backup.
+
 - OS: Rocky Linux 9/10 (juga CentOS/RHEL 7). Trivy mendukung Rocky 8, 9, dan 10.
 - Docker rootless milik user aplikasi, socket `/run/user/<uid>/docker.sock`.
 - Data-root Docker di luar lokasi bawaan (mis. `/data/docker`): tidak ikut scan disk agar tidak terbaca ganda.
@@ -145,7 +155,7 @@ Unggah dua file teks ini ke chat:
 
 ## Batasan yang perlu diketahui
 
-- Library Java tanpa `groupId` (versi hanya terbaca dari nama file) tidak bisa dicocokkan Trivy. Jumlahnya tertulis di `sbom/RINGKASAN.txt`; library ini dinilai dari `.txt`.
+- Library Java tanpa `groupId` di dalam jar (mis. Spring, Tomcat, POI) diberi `groupId` dari tabel nama artifact umum, ditandai `assess:groupIdSource=tebakan-nama-artifact` di SBOM (temuan `SBOM-03`). Library internal yang tidak dikenali tetap tidak bisa dicocokkan Trivy (temuan `SBOM-02`); jumlahnya ada di `sbom/RINGKASAN.txt`.
 - Trivy tidak memeriksa Docker Compose. Compose diperiksa oleh `assess.sh` sendiri (temuan `CMP-*`).
 - Image yang tersimpan tetapi tidak berjalan hanya didaftar (`CNT-IDLE-01`), isinya tidak dipindai.
 - Bila perintah Docker tidak bisa dipakai sama sekali, container dibaca dari file di disk (`DKR-FSONLY-01`); image dan riwayat build tidak diperiksa.
