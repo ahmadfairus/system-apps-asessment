@@ -1,7 +1,7 @@
 #!/bin/bash
 #==============================================================================
 # assess.sh - Assessment keamanan server (READ-ONLY), SATU script SATU output
-# Versi : 4.0   Target: CentOS/RHEL 7 (juga RHEL/Rocky/Alma 8-9)
+# Versi : 4.7   Target: CentOS/RHEL 7 (juga RHEL/Rocky/Alma 8-9)
 # Cakupan: OS, SSH, akun, hardening, port, filesystem, Apache/Nginx, MariaDB/
 #          MySQL, PostgreSQL, WildFly/JBoss, Tomcat, Spring Boot, Java lain,
 #          inventaris SEMUA library Java di SELURUH disk (jar/war/ear, termasuk
@@ -47,7 +47,8 @@
 set -u
 umask 077
 
-SCRIPT_VERSION="4.6"
+SCRIPT_VERSION="4.7"
+APACHE_MIN="2.4.71"   # versi Apache aman minimal (untuk Apache hasil kompilasi sendiri); perbarui saat ada rilis keamanan
 OUTBASE="/tmp"
 SKIP_FS=0
 NO_NET=0
@@ -641,6 +642,7 @@ try:
         if re.search(r'simulat|mock|dummy|demo|sample|example|(^|[/_-])tests?([/_.-]|$)', s): return 'alat-uji'
         if 'konten-yatim' in s or '(nonaktif)' in s: return 'sisa-deploy'
         if re.search(r'apache-maven|/maven|gradle|apache-ant|/\.m2/|/\.gradle/|jenkins|sonar|/ivy', s): return 'tool-build'
+        if re.search(r'(^|[/_.-])bk([/_.-]|$)|\.(jar|war|ear|rar)[._-]\w+$', b): return 'backup'
         if re.search(r'backup|bak|bck|(^|[/_.-])old([/_.-]|$)|copy|arsip|archive|(^|[^0-9])(19|20)\d{2}[01]\d[0-3]\d([^0-9]|$)|(^|[^0-9])[0-3]\d[01]\d(19|20)\d{2}([^0-9]|$)', s): return 'backup'
         if un['kind'] == 'wildfly-install': return 'app-server-tidak-jalan'
         m = re.match(r'^(.+?)-(\d[\w.]*?)(\.(jar|war|ear))?$', b)
@@ -1043,17 +1045,29 @@ check_network() {
 # 6. FILESYSTEM
 #------------------------------------------------------------------------------
 # Cari SEMUA arsip Java (jar/war/ear/rar) di seluruh disk lokal -> masuk inventaris library
+# Arsip dengan nama tidak standar (app.jar_bk, app.jar.bak, app.war.20261127) hanya diambil bila memang file zip
+filter_archives() {
+  local f
+  while IFS= read -r f; do
+    case "${f,,}" in
+      *.jar|*.war|*.ear|*.rar) echo "$f" ;;
+      *.sha1|*.sha256|*.sha512|*.md5|*.asc|*.sig|*.pom|*.lastupdated|*.properties|*.txt|*.log|*.xml|*.json|*.repositories|*.lck|*.tmp) ;;
+      *) is_zip "$f" && echo "$f" ;;
+    esac
+  done
+}
+
 scan_disk_archives_only() {
   local mp
   log "Mencari semua arsip Java (jar/war/ear) di seluruh disk lokal"
   for mp in $(df -lP -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1{print $6}'); do
     timeout 1200 find "$mp" -xdev \( "${PRUNE_EXPR[@]}" \) -prune -o \
-      -type f \( \( \( -iname '*.jar' -o -iname '*.war' -o -iname '*.ear' -o -iname '*.rar' \) -printf 'AR %p\n' \) , \
+      -type f \( \( \( -iname '*.jar' -o -iname '*.war' -o -iname '*.ear' -o -iname '*.rar' -o -iname '*.jar[._-]*' -o -iname '*.war[._-]*' -o -iname '*.ear[._-]*' \) -printf 'AR %p\n' \) , \
                   \( \( -name package-lock.json -o -name yarn.lock -o -name composer.lock -o -name requirements.txt \) -printf 'MF %p\n' \) , \
                   \( \( -name Dockerfile -o -name 'Dockerfile.*' -o -name '*.dockerfile' -o -name Containerfile -o -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' -o -name compose.yml -o -name compose.yaml \) -printf 'DF %p\n' \) , \
                   \( -path '*/bin/java' -printf 'JV %p\n' \) \) 2>/dev/null
   done > "$OUT/.disk"
-  grep '^AR ' "$OUT/.disk" | cut -c4- | sort -u > "$RAW/disk_archives.txt"
+  grep '^AR ' "$OUT/.disk" | cut -c4- | sort -u | filter_archives > "$RAW/disk_archives.txt"
   grep '^JV ' "$OUT/.disk" | cut -c4- | sort -u > "$OUT/.javabins"
   grep '^MF ' "$OUT/.disk" | cut -c4- | sort -u > "$OUT/.manifests"
   grep '^DF ' "$OUT/.disk" | cut -c4- | sort -u > "$OUT/.cfgfiles"; rm -f "$OUT/.disk"
@@ -1111,7 +1125,7 @@ check_fs() {
   for mp in $(df -lP -x tmpfs -x devtmpfs 2>/dev/null | awk 'NR>1{print $6}'); do
     timeout 1200 find "$mp" -xdev \( "${PRUNE_EXPR[@]}" \) -prune -o \
       \( -type f \( \
-           \( \( -iname '*.jar' -o -iname '*.war' -o -iname '*.ear' -o -iname '*.rar' \) -printf 'AR %p\n' \) , \
+           \( \( -iname '*.jar' -o -iname '*.war' -o -iname '*.ear' -o -iname '*.rar' -o -iname '*.jar[._-]*' -o -iname '*.war[._-]*' -o -iname '*.ear[._-]*' \) -printf 'AR %p\n' \) , \
            \( -path '*/bin/java' -printf 'JV %p\n' \) , \
            \( \( -name package-lock.json -o -name yarn.lock -o -name composer.lock -o -name requirements.txt \) -printf 'MF %p\n' \) , \
            \( \( -name Dockerfile -o -name 'Dockerfile.*' -o -name '*.dockerfile' -o -name Containerfile -o -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' -o -name compose.yml -o -name compose.yaml \) -printf 'DF %p\n' \) , \
@@ -1126,7 +1140,7 @@ check_fs() {
   done
   grep '^WW ' "$tmp" | cut -c4- | grep -vE '^(/tmp|/var/tmp)/' | sort -u > "$RAW/fs_world_writable.txt"
   grep '^SU ' "$tmp" | cut -c4- | sort -u > "$RAW/fs_suid_sgid.txt"
-  grep '^AR ' "$tmp" | cut -c4- | sort -u > "$RAW/disk_archives.txt"
+  grep '^AR ' "$tmp" | cut -c4- | sort -u | filter_archives > "$RAW/disk_archives.txt"
   grep '^JV ' "$tmp" | cut -c4- | sort -u > "$OUT/.javabins"
   grep '^MF ' "$tmp" | cut -c4- | sort -u > "$OUT/.manifests"
   grep '^DF ' "$tmp" | cut -c4- | sort -u > "$OUT/.cfgfiles"
@@ -1213,48 +1227,899 @@ web_live_checks() { # $1=label, $2=pid
   done
 }
 
+# Daftar SEMUA file config Apache yang benar-benar dimuat (semua kedalaman & lokasi)
+apache_conf_files() { # $1=bin $2=root $3=config-utama $4..=argumen instance (-d/-f)
+  local bin="$1" root="$2" main="$3" out f p inc; shift 3
+  out=$("$bin" "$@" -t -D DUMP_INCLUDES 2>/dev/null | sed -n 's/^[[:space:]]*([0-9*]*)[[:space:]]*\(\/.*\)$/\1/p')
+  if [ -n "$out" ]; then echo "$out"; return 0; fi
+  # cadangan: telusuri Include/IncludeOptional secara rekursif
+  local queue=("$main") seen=" "
+  while [ ${#queue[@]} -gt 0 ]; do
+    f=${queue[0]}; queue=("${queue[@]:1}")
+    case "$seen" in *" $f "*) continue ;; esac
+    [ -f "$f" ] || continue
+    seen="$seen$f "; echo "$f"
+    while read -r p; do
+      [ -z "$p" ] && continue
+      [ "${p#/}" = "$p" ] && p="$root/$p"
+      [ -d "$p" ] && p="$p/*"
+      for inc in $p; do [ -f "$inc" ] && queue+=("$inc"); done
+    done < <(awk 'tolower($1) ~ /^include(optional)?$/ {v=$2; gsub(/["\047]/,"",v); print v}' "$f" 2>/dev/null)
+  done
+}
+
+# PID master setiap instance httpd/apache2 (bisa lebih dari satu, mis. instance custom dengan -f/-d)
+apache_instances() {
+  ps -eo pid=,ppid=,comm= 2>/dev/null | awk '$3=="httpd"||$3=="apache2"{c[$1]=1; p[$1]=$2} END{for(i in c) if(!(p[i] in c)) print i}' | sort -n
+}
+
 check_apache() {
-  local pid bin root conffiles f
-  pid=$(pgrep -o -x httpd); bin=$(pid_exe "$pid"); [ -x "$bin" ] || bin=/usr/sbin/httpd
-  log "Cek Apache httpd ($bin)"
-  root=$("$bin" -V 2>/dev/null | sed -n 's/.*HTTPD_ROOT="\(.*\)"/\1/p')
-  if [ ! -d "$root" ]; then case "$bin" in /opt/rh/*/root/*) root="${bin%%/root/*}/root/etc/httpd" ;; *) root=/etc/httpd ;; esac; fi
-  { "$bin" -v; echo; "$bin" -S; echo; "$bin" -M; } > "$RAW/httpd_info.txt" 2>&1
-  conffiles=$(find "$root" -maxdepth 2 -name '*.conf' 2>/dev/null | sort)
-  for f in $conffiles; do echo "##### $f"; grep -vE '^\s*(#|$)' "$f" | redact; done > "$RAW/httpd_config.txt" 2>/dev/null
-  local c="$RAW/httpd_config.txt"
-  grep -iE '^\s*(ProxyPass|ProxyPassReverse|BalancerMember|RewriteRule.*\[P|<VirtualHost|ServerName|SSLCertificateFile)' "$c" > "$RAW/httpd_proxy_map.txt"
+  local pid bin root main sr f n=0 c="$RAW/httpd_config.txt" a_f a_d iname list ver docroots
+  : > "$c"; : > "$RAW/httpd_config_full.txt"; : > "$RAW/httpd_info.txt"
+  for pid in $(apache_instances); do
+    n=$((n+1)); bin=$(pid_exe "$pid"); [ -x "$bin" ] || bin=/usr/sbin/httpd
+    a_f=$(arg_next "$pid" -f); a_d=$(arg_next "$pid" -d)
+    local args=()
+    [ -n "$a_d" ] && args+=(-d "$a_d")
+    [ -n "$a_f" ] && args+=(-f "$a_f")
+    root=${a_d:-$("$bin" -V 2>/dev/null | sed -n 's/.*HTTPD_ROOT="\(.*\)"/\1/p')}
+    if [ ! -d "$root" ]; then case "$bin" in /opt/rh/*/root/*) root="${bin%%/root/*}/root/etc/httpd" ;; *) root=/etc/httpd ;; esac; fi
+    main=${a_f:-$("$bin" -V 2>/dev/null | sed -n 's/.*SERVER_CONFIG_FILE="\(.*\)"/\1/p')}
+    [ -n "$main" ] && [ "${main#/}" = "$main" ] && main="$root/$main"
+    sr=$(awk 'tolower($1)=="serverroot"{v=$2; gsub(/["\047]/,"",v); print v; exit}' "$main" 2>/dev/null)
+    [ -n "$sr" ] && [ -d "$sr" ] && root="$sr"
+    iname="httpd#$n"
+    log "Cek Apache httpd instance $n: $bin (PID $pid, ServerRoot $root, config $main)"
+    { echo "===== instance $n: $bin PID $pid  ServerRoot=$root  config=$main"
+      "$bin" ${args[@]+"${args[@]}"} -v; echo; "$bin" ${args[@]+"${args[@]}"} -S; echo; "$bin" ${args[@]+"${args[@]}"} -M; echo; } >> "$RAW/httpd_info.txt" 2>&1
+    list=$(apache_conf_files "$bin" "$root" "$main" ${args[@]+"${args[@]}"} | awk '!s[$0]++')
+    [ -z "$list" ] && list=$(find "$root" -maxdepth 8 -name '*.conf' 2>/dev/null | sort)
+    while read -r f; do
+      [ -f "$f" ] || continue
+      printf 'apache\t%s\t%s\t%s\n' "$iname" "$root" "$f" >> "$OUT/.webfiles"
+      { echo "##### $f"; grep -vE '^\s*(#|$)' "$f" | redact; } >> "$c"
+      { echo "##### [$iname] $f  ($(stat -c '%A %U:%G %y' "$f" 2>/dev/null | cut -c1-45))"
+        awk '!/^[[:space:]]*$/{printf "%5d: %s\n", NR, $0}' "$f" | redact; echo; } >> "$RAW/httpd_config_full.txt"
+    done <<< "$list"
+    echo "$list" | awk -v i="$iname" 'NF{print "[" i "] " $0}' >> "$RAW/httpd_config_files.txt"
+    ver=$("$bin" -v 2>/dev/null | sed -n 's#.*Apache/\([0-9][0-9.]*\).*#\1#p' | head -n1)
+    finding INFO WEB-VER-01 Web "Versi Apache httpd ($iname)" "$("$bin" -v 2>/dev/null | head -n1) | $bin | $(echo "$list" | grep -c .) file config" \
+      "httpd bawaan distro mendapat backport patch selama OS didukung; Apache hasil kompilasi sendiri harus di-upgrade manual."
+    if ! rpm -qf "$bin" >/dev/null 2>&1 && ! dpkg -S "$bin" >/dev/null 2>&1; then
+      if [ -n "$ver" ] && ver_lt "$ver" "$APACHE_MIN"; then
+        finding HIGH WEB-VER-02 Web "Apache hasil kompilasi sendiri di bawah versi aman ($ver < $APACHE_MIN)" "$bin ($iname)" \
+          "Build ulang ke Apache $APACHE_MIN atau lebih baru (lihat httpd.apache.org/security/vulnerabilities_24.html); matikan modul yang tidak dipakai. Apache ini tidak ikut dnf/yum update."
+      else
+        finding INFO WEB-VER-03 Web "Apache hasil kompilasi sendiri (tidak ikut dnf/yum update)" "$bin versi $ver ($iname)" \
+          "Pantau rilis keamanan Apache dan upgrade manual."
+      fi
+    fi
+    web_live_checks apache "$pid"
+  done
+  # .htaccess di DocumentRoot (aturan akses tambahan di luar file config)
+  docroots=$(grep -ihE '^\s*DocumentRoot\s' "$c" | awk '{v=$2; gsub(/["\047]/,"",v); print v}' | sort -u)
+  for f in $docroots; do
+    [ -d "$f" ] && find "$f" -maxdepth 6 -name '.htaccess' -type f 2>/dev/null | head -n 200
+  done | while read -r f; do { echo "##### $f"; redact < "$f"; echo; }; done > "$RAW/httpd_htaccess.txt"
+  [ -s "$RAW/httpd_htaccess.txt" ] || rm -f "$RAW/httpd_htaccess.txt"
+  grep -iE '^\s*(ProxyPass|ProxyPassMatch|ProxyPassReverse|BalancerMember|RewriteRule.*\[P|<VirtualHost|<Location|ServerName|ServerAlias|Require|SSLCertificateFile|^##### )' "$c" > "$RAW/httpd_proxy_map.txt"
 
   grep -qiE '^\s*ProxyRequests\s+On' "$c" && finding HIGH WEB-PROXY-01 Web "Apache aktif sebagai open forward proxy" "ProxyRequests On" \
     "Set ProxyRequests Off (reverse proxy dengan ProxyPass tidak memerlukannya)."
-  grep -iE '^\s*Options\s' "$c" | grep -qiE '(^|[[:space:]+])Indexes' && finding LOW WEB-INDEX-01 Web "Directory listing (Options Indexes) aktif" \
-    "$(grep -iE '^\s*Options\s' "$c" | grep -iE '(^|[[:space:]+])Indexes' | head -n3 | tr '\n' ';')" "Ganti menjadi Options -Indexes."
+  if [ -z "$PY" ]; then
+    grep -iE '^\s*Options\s' "$c" | grep -qiE '(^|[[:space:]+])Indexes' && finding LOW WEB-INDEX-01 Web "Directory listing (Options Indexes) aktif" \
+      "$(grep -iE '^\s*Options\s' "$c" | grep -iE '(^|[[:space:]+])Indexes' | head -n3 | tr '\n' ';')" "Ganti menjadi Options -Indexes."
+  fi
   grep -qiE 'SetHandler\s+server-(status|info)' "$c" && finding LOW WEB-STATUS-01 Web "mod_status/mod_info aktif" \
     "$(grep -iE 'SetHandler\s+server-(status|info)' "$c" | head -n2 | tr '\n' ';')" "Pastikan hanya bisa diakses dari IP monitoring (Require ip ...), atau nonaktifkan."
+  local mods risky=""
+  mods=$(grep -oE '^ [a-z0-9_]+_module' "$RAW/httpd_info.txt" | tr -d ' ' | sort -u)
+  for f in dav_module dav_fs_module dav_lock_module info_module userdir_module proxy_ftp_module proxy_connect_module proxy_ajp_module \
+           proxy_scgi_module proxy_fdpass_module proxy_express_module cgi_module cgid_module vhost_alias_module dumpio_module autoindex_module lbmethod_heartbeat_module; do
+    echo "$mods" | grep -qx "$f" && risky="$risky ${f%_module}"
+  done
+  [ -n "$risky" ] && finding LOW WEB-MOD-01 Web "Modul Apache berisiko/umumnya tidak dipakai masih dimuat" "$risky" \
+    "Nonaktifkan LoadModule yang tidak dipakai (uji dengan apachectl -t lalu graceful). Mengurangi permukaan serangan, mis. CVE mod_dav/mod_proxy_ftp."
   if [ "$NO_NET" -eq 1 ]; then
     grep -qiE '^\s*ServerTokens\s+Prod' "$c" || finding LOW WEB-BANNER-01 Web "ServerTokens bukan Prod" "-" "Set ServerTokens Prod dan ServerSignature Off."
     grep -qiE '^\s*TraceEnable\s+off' "$c" || finding LOW WEB-TRACE-01 Web "TraceEnable tidak dimatikan" "-" "Set TraceEnable off."
   fi
-  finding INFO WEB-VER-01 Web "Versi Apache httpd" "$("$bin" -v 2>/dev/null | head -n1)" \
-    "httpd 2.4.6 bawaan CentOS 7 mendapat backport patch hanya selama OS masih didukung; ikut rencana migrasi OS."
-  web_live_checks apache "$pid"
 }
 
 check_nginx() {
-  local pid bin c="$RAW/nginx_config.txt"
-  pid=$(pgrep -o -x nginx); bin=$(pid_exe "$pid"); [ -x "$bin" ] || bin=/usr/sbin/nginx
-  log "Cek Nginx ($bin)"
-  "$bin" -v > "$RAW/nginx_info.txt" 2>&1
-  if ! "$bin" -T 2>/dev/null | grep -vE '^\s*(#|$)' | redact > "$c" || [ ! -s "$c" ]; then
-    cat /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf 2>/dev/null | grep -vE '^\s*(#|$)' | redact > "$c"
+  local pid bin conf n=0 c="$RAW/nginx_config.txt" dump f prefix iname
+  : > "$c"; : > "$RAW/nginx_info.txt"
+  for pid in $(ps -eo pid=,ppid=,comm= 2>/dev/null | awk '$3=="nginx"{c[$1]=1; p[$1]=$2} END{for(i in c) if(!(p[i] in c)) print i}' | sort -n); do
+    n=$((n+1)); bin=$(pid_exe "$pid"); [ -x "$bin" ] || bin=/usr/sbin/nginx
+    conf=$(arg_next "$pid" -c); iname="nginx#$n"
+    prefix=$("$bin" -V 2>&1 | grep -oE -- '--prefix=[^ ]+' | cut -d= -f2)
+    log "Cek Nginx instance $n: $bin (PID $pid${conf:+, config $conf})"
+    { echo "===== instance $n: $bin PID $pid config=${conf:-default}"; "$bin" -V; echo; } >> "$RAW/nginx_info.txt" 2>&1
+    dump=$("$bin" ${conf:+-c "$conf"} -T 2>/dev/null)
+    if [ -n "$dump" ]; then
+      echo "$dump" | grep -vE '^\s*$' | redact >> "$c"
+      echo "$dump" | sed -n 's/^# configuration file \(.*\):$/\1/p' | while read -r f; do
+        [ -f "$f" ] && printf 'nginx\t%s\t%s\t%s\n' "$iname" "${prefix:-/etc/nginx}" "$f" >> "$OUT/.webfiles"
+      done
+    else
+      for f in ${conf:-/etc/nginx/nginx.conf} /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* /etc/nginx/default.d/*.conf; do
+        [ -f "$f" ] || continue
+        { echo "# configuration file $f:"; grep -vE '^\s*$' "$f" | redact; } >> "$c"
+        printf 'nginx\t%s\t%s\t%s\n' "$iname" "${prefix:-/etc/nginx}" "$f" >> "$OUT/.webfiles"
+      done
+    fi
+    finding INFO WEB-VER-02 Web "Versi Nginx ($iname)" "$("$bin" -v 2>&1 | head -n1) | $bin" "Pastikan versi nginx masih menerima update keamanan."
+    web_live_checks nginx "$pid"
+  done
+  grep -E '^\s*(proxy_pass|upstream|server_name|listen|location|allow|deny|ssl_certificate )|^# configuration file' "$c" > "$RAW/nginx_proxy_map.txt"
+  if [ -z "$PY" ]; then
+    grep -qE '^\s*autoindex\s+on' "$c" && finding LOW WEB-INDEX-01 Web "Directory listing (autoindex on) aktif" "nginx autoindex on" "Set autoindex off."
   fi
-  grep -E '^\s*(proxy_pass|upstream|server_name|listen|ssl_certificate )' "$c" > "$RAW/nginx_proxy_map.txt"
-  grep -qE '^\s*autoindex\s+on' "$c" && finding LOW WEB-INDEX-01 Web "Directory listing (autoindex on) aktif" "nginx autoindex on" "Set autoindex off."
   if [ "$NO_NET" -eq 1 ]; then
     grep -qE '^\s*server_tokens\s+off' "$c" || finding LOW WEB-BANNER-01 Web "server_tokens tidak dimatikan" "-" "Set server_tokens off; di blok http."
   fi
-  finding INFO WEB-VER-02 Web "Versi Nginx" "$(cat "$RAW/nginx_info.txt")" "Pastikan versi nginx masih menerima update keamanan."
-  web_live_checks nginx "$pid"
+}
+
+# Lokasi log aplikasi Java (logback/log4j2, logging.file.*, WildFly, Tomcat) -> $OUT/.applogs
+#   format: label<TAB>path<TAB>sumber<TAB>folder-kerja<TAB>properti(k=v;k=v)
+app_log_targets() { # $1=pid $2=label [$3=file config Spring gabungan]
+  local pid="$1" label="$2" cfg="${3:-}" cwd v f props
+  cwd=$(pid_cwd "$pid")
+  {
+    v=$(arg_val "$pid" -Djboss.server.log.dir)
+    if [ -n "$v" ]; then printf '%s\t%s/*\t-Djboss.server.log.dir\t%s\t\n' "$label" "$v" "$cwd"
+    else v=$(arg_val "$pid" -Djboss.home.dir); [ -n "$v" ] && printf '%s\t%s/standalone/log/*\tjboss.home.dir\t%s\t\n' "$label" "$v" "$cwd"; fi
+    v=$(arg_val "$pid" -Dcatalina.base); [ -n "$v" ] && printf '%s\t%s/logs/*\tcatalina.base\t%s\t\n' "$label" "$v" "$cwd"
+    for v in "$(arg_val "$pid" -Dlogging.file.name)" "$(arg_val "$pid" --logging.file.name)"; do
+      [ -n "$v" ] && printf '%s\t%s\tlogging.file.name (cmdline)\t%s\t\n' "$label" "$v" "$cwd"; done
+    for v in "$(arg_val "$pid" -Dlogging.file.path)" "$(arg_val "$pid" --logging.file.path)" "$(arg_val "$pid" -DLOG_PATH)"; do
+      [ -n "$v" ] && printf '%s\t%s/*\tlogging.file.path (cmdline)\t%s\t\n' "$label" "$v" "$cwd"; done
+    if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+      grep -E '^\s*logging\.file\.name\s*[=:]' "$cfg" | sed -E 's/^[^=:]*[=:][[:space:]]*//' | while read -r v; do
+        printf '%s\t%s\tlogging.file.name (config)\t%s\t\n' "$label" "$v" "$cwd"; done
+      grep -E '^\s*logging\.file\.path\s*[=:]' "$cfg" | sed -E 's/^[^=:]*[=:][[:space:]]*//' | while read -r v; do
+        printf '%s\t%s/*\tlogging.file.path (config)\t%s\t\n' "$label" "$v" "$cwd"; done
+    fi
+    for f in "$(arg_val "$pid" -Dlogging.config)" "$(arg_val "$pid" --logging.config)" "$(arg_val "$pid" -Dlogback.configurationFile)" \
+             "$(arg_val "$pid" -Dlog4j.configurationFile)" "$(arg_val "$pid" -Dlog4j2.configurationFile)" "$(arg_val "$pid" -Dlog4j.configuration)" \
+             "$cwd"/logback*.xml "$cwd"/log4j2*.xml "$cwd"/log4j*.properties "$cwd"/config/logback*.xml "$cwd"/config/log4j2*.xml; do
+      f=${f#classpath:}; f=${f#file:}
+      [ -n "$f" ] || continue
+      [ "${f#/}" = "$f" ] && f="$cwd/$f"
+      [ -f "$f" ] || continue
+      { echo "##### $label: $f"; redact < "$f"; echo; } >> "$RAW/app_log_configs.txt"
+      props=$(grep -oE '<property[^>]+name="[^"]+"[^>]+value="[^"]+"' "$f" | sed -E 's/.*name="([^"]+)".*value="([^"]+)".*/\1=\2/' | tr '\n' ';')
+      props="$props$(grep -oE '<Property name="[^"]+">[^<]+' "$f" | sed -E 's/<Property name="([^"]+)">/\1=/' | tr '\n' ';')"
+      { grep -oE '<(file|fileName|fileNamePattern)>[^<]+' "$f" | sed 's/^<[^>]*>//'
+        grep -oiE '(fileName|filePattern)="[^"]+"' "$f" | sed 's/^[^"]*"//; s/"$//'
+        grep -E '^\s*log4j\.appender\.[^.]+\.File\s*=' "$f" | sed -E 's/^[^=]*=[[:space:]]*//'; } | while read -r v; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$v" "$(basename "$f")" "$cwd" "$props"; done
+    done
+  } >> "$OUT/.applogs" 2>/dev/null
+  return 0
+}
+
+# Analisis reverse proxy (bypass whitelist), cipher/protokol per baris, lokasi & izin log,
+# dan jejak serangan di access log. Input: $OUT/.webfiles, $OUT/.applogs
+analyze_web_and_logs() {
+  [ -s "$OUT/.webfiles" ] || [ -s "$OUT/.applogs" ] || return 0
+  if [ -z "$PY" ]; then
+    finding INFO WEB-ANA-00 Web "Analisis config web & log dilewati (python tidak tersedia)" "-" "Jalankan di server yang punya python3, atau review manual raw/httpd_config_full.txt."
+    return 0
+  fi
+  local mb=40; [ "$SAFE" -eq 1 ] && mb=5
+  touch "$OUT/.webfiles" "$OUT/.applogs"
+  log "Analisis reverse proxy, lokasi log, dan jejak serangan di access log (maks $mb MB/file)"
+  timeout 900 "$PY" - "$HOST" "$OUT/.webfiles" "$OUT/.applogs" "$RAW" "$FINDINGS" "$mb" 2>>"$RAW/web_analyzer_errors.txt" <<'PYEOF' >&2
+# -*- coding: utf-8 -*-
+# Analisis config web (Apache/Nginx) + lokasi log + jejak serangan di access log.
+# argv: host webfiles applogs outdir findings_csv maxmb
+from __future__ import print_function, unicode_literals
+import sys, os, re, io, glob, time, gzip, collections
+
+host, webfiles, applogs, outd, find_out, maxmb = sys.argv[1:7]
+MAXB = int(maxmb) * 1024 * 1024
+NOW = time.time()
+FIND = []
+
+
+def fnd(sev, cid, cat, title, ev, rec):
+    FIND.append((sev, cid, cat, title, ev, rec))
+
+
+def rd(p):
+    try:
+        return io.open(p, encoding='utf-8', errors='replace').read().split('\n')
+    except Exception:
+        return []
+
+
+def lines_of(p):
+    """(nomor_baris, teks) dengan sambungan backslash digabung."""
+    out, buf, start = [], '', None
+    for i, l in enumerate(rd(p), 1):
+        if start is None:
+            start = i
+        s = l.rstrip()
+        if s.endswith('\\'):
+            buf += s[:-1] + ' '
+            continue
+        out.append((start, (buf + l).strip()))
+        buf, start = '', None
+    return out
+
+
+def toks(s):
+    r, cur, q = [], '', None
+    for ch in s:
+        if q:
+            if ch == q:
+                q = None
+            else:
+                cur += ch
+        elif ch in '"\'':
+            q = ch
+        elif ch.isspace():
+            if cur:
+                r.append(cur)
+                cur = ''
+        else:
+            cur += ch
+    if cur:
+        r.append(cur)
+    return r
+
+
+def url_parts(u):
+    m = re.match(r'^([a-z0-9+]+)://([^/:]+)(?::(\d+))?(/.*)?$', u, re.I)
+    if not m:
+        return None
+    sch = m.group(1).lower()
+    port = m.group(3) or {'http': '80', 'https': '443', 'ajp': '8009', 'ws': '80', 'wss': '443'}.get(sch, '')
+    return (sch, m.group(2).lower(), port, m.group(4) or '')
+
+
+def pmatch(prefix, path):
+    """Pencocokan prefix ala ProxyPass/Alias: harus berhenti di batas '/'."""
+    if prefix in ('', '/'):
+        return True
+    if not path.startswith(prefix):
+        return False
+    return prefix.endswith('/') or len(path) == len(prefix) or path[len(prefix)] == '/'
+
+
+def is_loop(h):
+    return h in ('localhost', '::1') or h.startswith('127.')
+
+
+# --------------------------------------------------------------------- parsing
+inst = collections.OrderedDict()   # instance -> {'kind', 'root', 'files'}
+for ln in io.open(webfiles, encoding='utf-8', errors='replace'):
+    p = ln.rstrip('\n').split('\t')
+    if len(p) < 4:
+        continue
+    kind, iname, root, f = p[:4]
+    d = inst.setdefault(iname, {'kind': kind, 'root': root, 'files': []})
+    if f not in d['files']:
+        d['files'].append(f)
+
+VH = []        # vhost: name, inst, file, line, locs, maps, excl
+LOGS = []      # (inst, vhost, directive, value, fmt, file, line, root)
+CFGL = []      # (inst, file, line, text) untuk cek per-baris
+COMM = []      # (file, line, comment, next_require_ip_line)
+
+
+def new_vh(name, iname, f, n):
+    v = {'name': name, 'inst': iname, 'file': f, 'line': n, 'locs': [], 'maps': [], 'excl': [], 'bal': {}}
+    VH.append(v)
+    return v
+
+
+def restricted_reqs(reqs):
+    hard = [r for r in reqs if not re.match(r'(?i)^require\s+all\s+granted$', r)]
+    return bool(hard), hard
+
+
+def parse_apache(iname, d):
+    gl = new_vh('(global)', iname, '-', 0)
+    for f in d['files']:
+        cur = gl
+        stack = []           # (tag, loc_dict|None)
+        loc = None
+        pend_comment = None
+        for n, t in lines_of(f):
+            if not t:
+                continue
+            if t.startswith('#'):
+                pend_comment = (f, n, t)
+                continue
+            CFGL.append((iname, f, n, t))
+            tl = t.lower()
+            m = re.match(r'^<\s*(/)?\s*([a-z]+)\s*([^>]*)>', t, re.I)
+            if m:
+                close, tag, arg = m.group(1), m.group(2).lower(), m.group(3).strip().strip('"\'')
+                if not close:
+                    if tag == 'virtualhost':
+                        cur = new_vh('', iname, f, n)
+                        cur['addr'] = arg
+                        stack.append((tag, None))
+                    elif tag in ('location', 'locationmatch'):
+                        rx = tag == 'locationmatch' or arg.startswith('~')
+                        loc = {'path': arg.lstrip('~ ').strip('"\''), 'rx': rx, 'reqs': [], 'file': f, 'line': n}
+                        cur['locs'].append(loc)
+                        stack.append((tag, loc))
+                    elif tag == 'proxy' and arg.lower().startswith('balancer://'):
+                        cur['_bal'] = arg.rstrip('/')
+                        cur['bal'].setdefault(cur['_bal'], [])
+                        stack.append((tag, None))
+                    else:
+                        stack.append((tag, None))
+                else:
+                    while stack:
+                        tg, lo = stack.pop()
+                        if tg == tag:
+                            break
+                    if tag == 'virtualhost':
+                        cur = gl
+                    if tag in ('location', 'locationmatch'):
+                        loc = None
+                        for tg, lo in reversed(stack):
+                            if lo is not None:
+                                loc = lo
+                                break
+                    if tag == 'proxy':
+                        cur.pop('_bal', None)
+                continue
+            tk = toks(t)
+            if not tk:
+                continue
+            dname = tk[0].lower()
+            if dname in ('servername',) and len(tk) > 1 and cur is not gl and not cur['name']:
+                cur['name'] = tk[1]
+            elif dname in ('require', 'allow', 'deny', 'satisfy', 'authtype') and loc is not None:
+                loc['reqs'].append(' '.join(tk))
+                if dname == 'require' and len(tk) > 1 and tk[1].lower() == 'ip' and pend_comment:
+                    COMM.append((pend_comment[0], pend_comment[1], pend_comment[2], n, ' '.join(tk[2:])))
+            elif dname == 'balancermember' and len(tk) > 1 and cur.get('_bal'):
+                cur['bal'][cur['_bal']].append(tk[1])
+            elif dname in ('proxypass', 'proxypassmatch'):
+                args = [a for a in tk[1:] if '=' not in a or a.startswith(('http', 'ajp', 'ws', 'balancer', 'fcgi', 'h2', 'unix'))]
+                if loc is not None and len(args) >= 1:
+                    front, back = loc['path'], args[0]
+                    kind = 'ppm' if loc['rx'] else 'pp'
+                elif len(args) >= 2:
+                    front, back = args[0], args[1]
+                    kind = 'ppm' if dname == 'proxypassmatch' else 'pp'
+                else:
+                    continue
+                if back == '!':
+                    cur['excl'].append((front, kind))
+                else:
+                    cur['maps'].append({'front': front, 'back': back, 'kind': kind, 'loc': loc, 'file': f, 'line': n})
+            elif dname == 'rewriterule' and len(tk) >= 3 and re.search(r'\[[^\]]*\bP\b', ' '.join(tk[3:]), re.I):
+                cur['maps'].append({'front': tk[1], 'back': tk[2], 'kind': 'rw', 'loc': loc, 'file': f, 'line': n})
+            elif dname in ('errorlog', 'customlog', 'transferlog') and len(tk) > 1:
+                LOGS.append((iname, cur['name'] or cur.get('addr', '(global)'), dname, tk[1], tk[2] if len(tk) > 2 else '', f, n, d['root']))
+            if dname != 'require':
+                pend_comment = None if dname not in ('require',) else pend_comment
+
+
+def parse_nginx(iname, d):
+    gl = new_vh('(global)', iname, '-', 0)
+    for f in d['files']:
+        stack = []
+        cur, loc = gl, None
+        pend_comment = None
+        text = []
+        for n, l in enumerate(rd(f), 1):
+            s = l.strip()
+            if s.startswith('#'):
+                pend_comment = (f, n, s)
+                continue
+            s = re.sub(r'\s#.*$', '', s)
+            if not s:
+                continue
+            CFGL.append((iname, f, n, s))
+            # pisahkan per ; { }
+            for part in re.findall(r'[^;{}]+[;{}]|[{}]', s):
+                part = part.strip()
+                if part == '}':
+                    if stack:
+                        tg, obj = stack.pop()
+                        if tg == 'server':
+                            cur = gl
+                        if tg == 'location':
+                            loc = None
+                            for t2, o2 in reversed(stack):
+                                if t2 == 'location':
+                                    loc = o2
+                                    break
+                    continue
+                body = part.rstrip(';{').strip()
+                tk = toks(body)
+                if not tk:
+                    continue
+                dn = tk[0].lower()
+                if part.endswith('{'):
+                    if dn == 'server':
+                        cur = new_vh('', iname, f, n)
+                        stack.append(('server', cur))
+                    elif dn == 'location':
+                        a = tk[1:]
+                        rx = bool(a) and a[0] in ('~', '~*')
+                        mod = a[0] if a and a[0] in ('=', '^~', '~', '~*') else ''
+                        path = a[-1] if a else '/'
+                        loc = {'path': path, 'rx': rx, 'exact': mod == '=', 'reqs': [], 'file': f, 'line': n}
+                        cur['locs'].append(loc)
+                        stack.append(('location', loc))
+                    else:
+                        stack.append((dn, None))
+                    continue
+                if dn == 'server_name' and len(tk) > 1 and cur is not gl and not cur['name']:
+                    cur['name'] = tk[1]
+                elif dn in ('allow', 'deny', 'auth_basic', 'auth_request', 'satisfy') and loc is not None:
+                    if not (dn == 'auth_basic' and len(tk) > 1 and tk[1] == 'off'):
+                        loc['reqs'].append(' '.join(tk))
+                    if dn == 'allow' and pend_comment:
+                        COMM.append((pend_comment[0], pend_comment[1], pend_comment[2], n, ' '.join(tk[1:])))
+                elif dn == 'proxy_pass' and len(tk) > 1 and loc is not None:
+                    kind = 'ppm' if loc['rx'] else ('exact' if loc.get('exact') else 'pp')
+                    cur['maps'].append({'front': loc['path'], 'back': tk[1], 'kind': kind, 'loc': loc, 'file': f, 'line': n, 'ngx': True})
+                elif dn in ('access_log', 'error_log') and len(tk) > 1:
+                    LOGS.append((iname, cur['name'] or '(global)', dn, tk[1], tk[2] if len(tk) > 2 else '', f, n, d['root']))
+                if dn != 'allow':
+                    pend_comment = None
+
+
+for iname, d in inst.items():
+    (parse_apache if d['kind'] == 'apache' else parse_nginx)(iname, d)
+
+
+# ------------------------------------------------------- pemetaan proxy & akses
+def loc_restricted_for(v, path):
+    """Location dengan pembatasan yang mencakup path (prefix ala <Location>, atau regex)."""
+    for lo in v['locs']:
+        r, hard = restricted_reqs(lo['reqs'])
+        if not r:
+            continue
+        if lo['rx']:
+            try:
+                if re.search(lo['path'], path):
+                    return lo, hard
+            except re.error:
+                pass
+        elif lo.get('exact'):
+            if path == lo['path']:
+                return lo, hard
+        elif path.startswith(lo['path']):
+            return lo, hard
+    return None, []
+
+
+def excluded(v, path):
+    for fr, k in v['excl']:
+        if k == 'pp' and pmatch(fr, path):
+            return True
+        if k == 'ppm':
+            try:
+                if re.search(fr, path):
+                    return True
+            except re.error:
+                pass
+    return False
+
+
+def backends(v, back):
+    b = back.rstrip('/')
+    for vv in VH:
+        if vv['inst'] == v['inst'] and b in vv['bal']:
+            return vv['bal'][b] or [back]
+    return [back]
+
+
+ROWS, PUB, RES = [], [], []
+for v in VH:
+    vname = v['name'] or v.get('addr', '(global)')
+    for mp in v['maps']:
+        lo = mp['loc']
+        if lo is not None:
+            r, hard = restricted_reqs(lo['reqs'])
+            rl = lo if r else None
+        else:
+            rl, hard = loc_restricted_for(v, mp['front']) if mp['kind'] == 'pp' else (None, [])
+        acc = ('DIBATASI: ' + '; '.join(hard)[:160]) if rl else 'PUBLIK'
+        for b in backends(v, mp['back']):
+            ROWS.append((v['inst'], vname, mp['kind'], mp['front'], b, acc, '%s:%d' % (mp['file'], mp['line'])))
+            ent = dict(mp, vh=v, vname=vname, b=b, up=url_parts(b))
+            if ent['up'] is None:
+                continue
+            (RES if rl else PUB).append(ent)
+
+
+def effective(v, path):
+    """Mapping pertama (urutan config) yang menangani path di vhost v."""
+    best = None
+    for mp in v['maps']:
+        if mp['kind'] == 'pp' and pmatch(mp['front'], path):
+            if mp['loc'] is not None:      # ProxyPass di dalam <Location>: prefix string
+                if not path.startswith(mp['front']):
+                    continue
+            return mp
+        if mp['kind'] == 'exact' and mp['front'] == path:
+            return mp
+        if mp['kind'] in ('ppm',):
+            try:
+                if re.search(mp['front'], path):
+                    return mp
+            except re.error:
+                pass
+    return best
+
+
+def ngx_backend_path(mp, path):
+    """nginx: proxy_pass dengan URI mengganti bagian location; tanpa URI meneruskan path asli."""
+    up = url_parts(mp['back'])
+    if not up:
+        return None
+    if up[3] == '':
+        return path
+    return up[3] + path[len(mp['front']):]
+
+
+seen = set()
+for r in RES:
+    rs, rh, rp, rpath = r['up']
+    for p in PUB:
+        if p['kind'] not in ('pp',):
+            continue
+        ps, phh, pp_, ppath = p['up']
+        if (rh, rp) != (phh, pp_):
+            continue
+        if p.get('ngx'):
+            base = ppath if ppath else p['front']
+            if not pmatch(base, rpath):
+                continue
+            cand = p['front'] + rpath[len(base):] if ppath else rpath
+        else:
+            if not pmatch(ppath, rpath):
+                continue
+            cand = p['front'] + rpath[len(ppath):]
+        cand = re.sub(r'/{2,}', '/', cand)
+        if cand == r['front'] and p['vh'] is r['vh']:
+            continue
+        v = p['vh']
+        lo, _ = loc_restricted_for(v, cand)
+        if lo is not None or excluded(v, cand):
+            continue
+        eff = effective(v, cand)
+        if eff is not None and eff is not p and eff.get('front') != p['front']:
+            continue
+        key = (r['vname'], r['front'], p['vname'], cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        fnd('HIGH', 'WEB-PROXY-BYPASS-01', 'Web',
+            'Pembatasan akses reverse proxy bisa dilewati lewat path publik lain',
+            '%s%s (publik, %s:%d) -> %s; backend yang sama di %s%s dibatasi (%s:%d)' % (
+                p['vname'], cand, p['file'], p['line'], r['b'], r['vname'], r['front'], r['file'], r['line']),
+            'ProxyPass memakai pencocokan prefix: sisa path ikut diteruskan ke backend. Ubah mapping publik menjadi exact '
+            '(Apache: ProxyPassMatch "^/path$" url; Nginx: location = /path) dan/atau tambahkan <Location "/path/"> Require all denied. '
+            'Uji dengan curl dari IP di luar whitelist: harus 403.')
+
+pub_root = [p for p in PUB if p['kind'] == 'pp' and p['up'][3] in ('', '/') and p['front'] not in ('/',)]
+for p in pub_root[:10]:
+    fnd('INFO', 'WEB-PROXY-02', 'Web', 'Path publik meneruskan seluruh aplikasi backend',
+        '%s%s -> %s (%s:%d)' % (p['vname'], p['front'], p['b'], p['file'], p['line']),
+        'Pastikan semua endpoint di backend memang boleh publik (UI admin, actuator, callback). Batasi path sensitif dengan <Location>/location.')
+
+plain = sorted(set('%s -> %s' % (p['front'], p['b']) for p in PUB + RES if p['up'][0] in ('http', 'ajp', 'ws') and not is_loop(p['up'][1])))
+if plain:
+    fnd('LOW', 'WEB-BACKEND-01', 'Web', '%d mapping proxy ke backend memakai protokol tanpa enkripsi' % len(plain),
+        '; '.join(plain[:12]),
+        'Gunakan https ke backend (Apache: SSLProxyEngine on + SSLProxyVerify require) atau batasi port backend dengan firewall hanya dari IP proxy.')
+
+
+# ------------------------------------------------------- cek per baris config
+WEAKC = re.compile(r'^(RC4|3DES|DES|NULL|EXPORT|EXP|MD5|aNULL|eNULL|ADH|AECDH|LOW|MEDIUM|ALL|DEFAULT)$|RC4|3DES|DES-CBC|NULL|EXPORT|-MD5$|^(ECDHE-(RSA|ECDSA)-|DHE-RSA-)?(AES(128|256)|CAMELLIA(128|256)|SEED|IDEA)-SHA$|^(AES|AES128|AES256|DES|CAMELLIA)(-|$)|^RSA|^(ECDHE|DHE)-(RSA|ECDSA)-AES(128|256)-SHA(256|384)$', re.I)
+proto_bad, ciph_bad, idx = [], [], []
+for iname, f, n, t in CFGL:
+    tk = toks(t)
+    if not tk:
+        continue
+    dn = tk[0].lower()
+    if dn in ('sslciphersuite', 'ssl_ciphers'):
+        val = (tk[2] if len(tk) > 2 and tk[1].lower() in ('sslv3', 'tlsv1.3') else (tk[1] if len(tk) > 1 else '')).rstrip(';')
+        if len(tk) > 2 and tk[1].upper() == 'TLSV1.3':
+            continue
+        bad = [c for c in re.split(r'[:\s,]+', val) if c and not c.startswith(('!', '-')) and WEAKC.search(c)]
+        if bad:
+            ciph_bad.append('%s:%d [%s]' % (f, n, ','.join(bad[:6])))
+    elif dn in ('sslprotocol', 'ssl_protocols', 'sslproxyprotocol'):
+        v = ' '.join(tk[1:]).rstrip(';')
+        low = v.lower()
+        bad = re.search(r'(^|\s)\+?(sslv2|sslv3|tlsv1|tlsv1\.1)(\s|$)', low) or \
+            (re.search(r'(^|\s)\+?all(\s|$)', low) and not (re.search(r'-tlsv1(\s|$)', low) and re.search(r'-tlsv1\.1(\s|$)', low)))
+        if bad:
+            proto_bad.append('%s:%d [%s]' % (f, n, v))
+    elif dn == 'options' and any(re.match(r'^\+?indexes$', x, re.I) for x in tk[1:]):
+        idx.append('%s:%d' % (f, n))
+    elif dn == 'autoindex' and len(tk) > 1 and tk[1].lower().rstrip(';') == 'on':
+        idx.append('%s:%d' % (f, n))
+if ciph_bad:
+    fnd('MEDIUM', 'WEB-TLSCFG-01', 'Web', 'Cipher TLS lemah di konfigurasi (CBC-SHA1 / tanpa forward secrecy / usang)',
+        '; '.join(ciph_bad[:8]),
+        'Pakai profil Mozilla intermediate: ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:'
+        'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305. Konfirmasi dulu kompatibilitas client/partner.')
+if proto_bad:
+    fnd('MEDIUM', 'WEB-TLSCFG-02', 'Web', 'Protokol TLS usang diizinkan di konfigurasi',
+        '; '.join(proto_bad[:8]), 'Apache: SSLProtocol -all +TLSv1.2 +TLSv1.3; Nginx: ssl_protocols TLSv1.2 TLSv1.3;')
+if idx:
+    fnd('LOW', 'WEB-INDEX-01', 'Web', 'Directory listing aktif (Options Indexes / autoindex on)', '; '.join(idx[:10]),
+        'Apache: Options -Indexes; Nginx: autoindex off;')
+tmp_acl = [c for c in COMM if re.search(r'pentest|pen-test|sementara|temporary|\btemp\b|\btest|uji|trial|vendor', c[2], re.I)]
+if tmp_acl:
+    fnd('LOW', 'WEB-ACL-01', 'Web', 'IP sementara (pentest/uji/vendor) masih ada di whitelist',
+        '; '.join('%s:%d %s -> %s' % (c[0], c[3], c[2][:50], c[4]) for c in tmp_acl[:10]),
+        'Hapus IP sementara setelah kegiatan selesai; beri tanggal kedaluwarsa di komentar setiap entri whitelist.')
+
+# ------------------------------------------------------------------ lokasi log
+def strf_glob(p):
+    g = re.sub(r'%[a-zA-Z]', '*', p)
+    g = re.sub(r'\$\{[^}]*\}', '*', g)
+    return g
+
+
+def log_path(val, root):
+    v = val.strip().strip('"\'')
+    if v.startswith('|'):
+        tk = toks(v[1:].strip().strip('"\''))
+        c = [t for t in tk[1:] if t.startswith('/') or (not t.startswith('-') and '/' in t)]
+        if not c:
+            return None
+        v = c[0]
+    if v.lower() in ('off', '/dev/null', 'stderr') or v.startswith(('syslog', 'memory:')):
+        return None
+    if not v.startswith('/'):
+        v = os.path.join(root or '/', v)
+    return v
+
+
+ALOG = []      # (label, kind[access|error|app], template)
+for iname, vh, dn, val, fmt, f, n, root in LOGS:
+    p = log_path(val, root)
+    kind = 'error' if 'error' in dn else 'access'
+    if p:
+        ALOG.append(('%s %s' % (iname, vh), kind, p, fmt, '%s:%d' % (f, n)))
+UNRES = []
+
+
+def resolve_app(path, cwd, props):
+    """${X:-def} / ${X} dari <property> logback atau properti Spring; path relatif -> folder kerja."""
+    pr = {}
+    for kv in props.split(';'):
+        if '=' in kv:
+            k, v = kv.split('=', 1)
+            pr[k.strip()] = v.strip()
+    for _ in range(5):
+        m = re.search(r'\$\{([^}:]+)(:-([^}]*))?\}', path)
+        if not m:
+            break
+        k, dflt = m.group(1), m.group(3)
+        val = pr.get(k, pr.get(k.lower(), dflt))
+        if val is None:
+            return None
+        path = path[:m.start()] + val + path[m.end():]
+    path = re.sub(r'%d\{[^}]*\}|%i|%d', '*', path)
+    if not path.startswith('/'):
+        path = os.path.join(cwd or '/', path)
+    return os.path.normpath(path)
+
+
+if os.path.exists(applogs):
+    for ln in io.open(applogs, encoding='utf-8', errors='replace'):
+        p = ln.rstrip('\n').split('\t') + ['', '', '', '']
+        if not p[1].strip():
+            continue
+        rp = resolve_app(p[1].strip(), p[3], p[4])
+        if rp is None:
+            UNRES.append('%s: %s (%s)' % (p[0], p[1].strip(), p[2]))
+            continue
+        ALOG.append((p[0], 'app', rp, '', p[2] or '-'))
+
+stat_out = []
+ww, missing, full, common_fmt, stale = [], [], [], [], []
+acc_files = []
+done = set()
+for label, kind, tpl, fmt, src in ALOG:
+    g = strf_glob(tpl)
+    if g == tpl and kind != 'app':
+        g = tpl + '*'
+    elif g == tpl:
+        g = tpl + '*'
+    if os.path.isdir(tpl):
+        g = os.path.join(tpl, '*')
+    key = (g, kind)
+    if key in done:
+        continue
+    done.add(key)
+    fl = [x for x in glob.glob(g)[:20000] if os.path.isfile(x)]
+    dirn = os.path.dirname(tpl) if not os.path.isdir(tpl) else tpl
+    if not os.path.isdir(dirn):
+        missing.append('%s (%s, %s)' % (tpl, label, src))
+        stat_out.append('%-8s %s\n   template : %s\n   sumber   : %s\n   status   : FOLDER TIDAK ADA\n' % (kind, label, tpl, src))
+        continue
+    tot = sum(os.path.getsize(x) for x in fl)
+    mt = sorted((os.path.getmtime(x), x) for x in fl)
+    nww = [x for x in fl if os.stat(x).st_mode & 0o004]
+    try:
+        st = os.statvfs(dirn)
+        used = 100 - int(100.0 * st.f_bavail / max(1, st.f_blocks))
+    except Exception:
+        used = -1
+    try:
+        dm = oct(os.stat(dirn).st_mode & 0o777)[-3:]
+    except Exception:
+        dm = '?'
+    newest = (NOW - mt[-1][0]) / 86400 if mt else None
+    oldest = (NOW - mt[0][0]) / 86400 if mt else None
+    stat_out.append('%-8s %s\n   template : %s\n   sumber   : %s\n   folder   : %s (mode %s, disk terpakai %s%%)\n'
+                    '   file     : %d, total %.1f MB, terbaru %s hari lalu, tertua %s hari lalu, terbaca-semua-user: %d\n' % (
+                        kind, label, tpl, src, dirn, dm, used, len(fl), tot / 1048576.0,
+                        '%.1f' % newest if newest is not None else '-', '%.0f' % oldest if oldest is not None else '-', len(nww)))
+    if nww and not any(x.startswith(dirn + ' (') for x in ww):
+        ww.append('%s (%d file)' % (dirn, len(nww)))
+    if used >= 85 and not any(x.startswith(dirn + ' ') for x in full):
+        full.append('%s %d%%' % (dirn, used))
+    if kind == 'access' and (fmt.lower() == 'common' or (fmt and '%' in fmt and 'User-Agent' not in fmt)):
+        common_fmt.append('%s (%s)' % (label, src))
+    if kind == 'access' and newest is not None and newest > 2:
+        stale.append('%s: terakhir %.0f hari lalu' % (tpl, newest))
+    if kind == 'access':
+        acc_files += [x for t, x in mt if NOW - t < 8 * 86400]
+
+with io.open(os.path.join(outd, 'log_locations.txt'), 'w', encoding='utf-8') as fo:
+    fo.write('Lokasi log yang dikonfigurasi (web server + aplikasi) dan kondisinya\n\n')
+    fo.write('\n'.join(stat_out) if stat_out else '(tidak ada lokasi log terdeteksi)\n')
+    if UNRES:
+        fo.write('\nPath log aplikasi yang memakai variabel dan tidak bisa diresolve (cek manual):\n  ' + '\n  '.join(UNRES) + '\n')
+if ww:
+    fnd('LOW', 'LOG-PERM-01', 'Log', 'File log bisa dibaca semua user', '; '.join(ww[:10]),
+        'Log bisa berisi token, nomor kartu/akun, atau data pribadi. chmod 640 (grup admin/aplikasi) dan folder 750.')
+if full:
+    fnd('MEDIUM', 'LOG-DISK-01', 'Log', 'Disk lokasi log hampir penuh (>= 85%)', '; '.join(full),
+        'Atur rotasi & retensi (logrotate/rotatelogs), pindahkan arsip lama ke penyimpanan log terpusat. Disk penuh bisa menghentikan aplikasi dan logging.')
+if missing:
+    fnd('LOW', 'LOG-MISS-01', 'Log', 'Lokasi log di konfigurasi tidak ada', '; '.join(missing[:8]),
+        'Perbaiki path log; tanpa log tidak ada jejak untuk investigasi insiden.')
+if common_fmt:
+    fnd('LOW', 'LOG-FMT-01', 'Log', 'Access log memakai format tanpa User-Agent/Referer', '; '.join(common_fmt[:6]),
+        'Pakai format combined (Apache: LogFormat combined/combined_tls) agar log berguna untuk investigasi.')
+if stale:
+    fnd('INFO', 'LOG-STALE-01', 'Log', 'Access log tidak bertambah > 2 hari', '; '.join(stale[:6]),
+        'Pastikan logging berjalan (atau memang tidak ada traffic).')
+
+# -------------------------------------------- jejak serangan di access log
+PAT = [
+    ('jndi/log4shell', r'\$\{(jndi|\$\{|lower:|upper:|env:|::-)', True),
+    ('path-traversal', r'(\.\./|\.\.%2f|%2e%2e(%2f|/)|\.\.\\)', True),
+    ('baca-file-sistem', r'/etc/(passwd|shadow|hosts)|win\.ini|/proc/self/', True),
+    ('webshell', r'\.(jsp|jspx|php\d?|phtml|aspx?|ashx|cgi|pl|sh)\?[^ "]*\b(cmd|exec|command|shell|c|pass|pwd)=', True),
+    ('perintah-os', r'(cmd|exec|command|q|arg)=[^ "&]*(whoami|uname|%20id|wget%20|curl%20|bash|/bin/sh|nc%20|powershell)', True),
+    ('spring4shell/el', r'class\.module\.classLoader|\$\{T\(|%24%7BT%28|#\{.*\}', True),
+    ('sqli', r'(union(\s|%20|\+|/\*\*/)+(all(\s|%20|\+))?select|sleep\(\d|benchmark\(|%27(\s|%20|\+)*or(\s|%20|\+)|information_schema)', False),
+    ('xss', r'(<|%3c)(script|svg|img)[^a-z]', False),
+    ('file-sensitif', r'/(\.env|\.git/|\.svn/|\.htpasswd|\.aws/|wp-config\.php|web\.config|id_rsa|\.DS_Store|backup\.(zip|tar|sql))', False),
+    ('konsol-admin', r'/(manager/html|host-manager|jmx-console|web-console|invoker/|console(/|\b)|actuator|phpmyadmin|server-status|server-info|solr/|_ignition|druid/|swagger-ui|v2/api-docs|v3/api-docs|h2-console|jolokia)', False),
+    ('wordpress', r'(wp-login\.php|xmlrpc\.php|/wp-admin|/wp-content)', False),
+    ('scanner/tool', r'(sqlmap|nikto|nmap|masscan|zgrab|nuclei|acunetix|nessus|openvas|qualys|dirbuster|gobuster|ffuf|wpscan|feroxbuster|hydra|burp)', False),
+]
+CP = [(n, re.compile(r, re.I), h) for n, r, h in PAT]
+LINE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "([^"]*)" (\d{3})')
+stats = {n: {'n': 0, 'ok': 0, 'ip': collections.Counter(), 'okip': collections.Counter(), 'ex': []} for n, _, _ in CP}
+topip, tot, scanned, first, last = collections.Counter(), 0, [], None, None
+acc_files = sorted(set(acc_files), key=lambda x: -os.path.getmtime(x))[:16]
+
+
+def tail_lines(p):
+    try:
+        if p.endswith('.gz'):
+            fh = gzip.open(p, 'rb')
+            data = fh.read(MAXB)
+        else:
+            fh = io.open(p, 'rb')
+            sz = os.path.getsize(p)
+            if sz > MAXB:
+                fh.seek(sz - MAXB)
+            data = fh.read(MAXB)
+        fh.close()
+        return data.decode('utf-8', 'replace').split('\n')
+    except Exception:
+        return []
+
+
+def red(s):
+    s = re.sub(r'((pass(word|wd)?|pwd|token|secret|key|auth|signature|card|pan|cvv)[^=&]*=)[^&" ]+', r'\1****', s, flags=re.I)
+    return s[:220]
+
+
+for p in acc_files:
+    ls = tail_lines(p)
+    scanned.append('%s (%d baris)' % (p, len(ls)))
+    for l in ls:
+        m = LINE.match(l)
+        if not m:
+            continue
+        ip, ts, req, code = m.group(1), m.group(2), m.group(3), m.group(4)
+        tot += 1
+        topip[ip] += 1
+        if first is None:
+            first = ts
+        last = ts
+        rest = l[m.end():]
+        for n, rx, hi in CP:
+            if rx.search(req) or (n == 'scanner/tool' and rx.search(rest)):
+                s = stats[n]
+                s['n'] += 1
+                s['ip'][ip] += 1
+                if code.startswith('2'):
+                    s['ok'] += 1
+                    s['okip'][ip] += 1
+                    if len(s['ex']) < 5:
+                        s['ex'].append(red('%s [%s] "%s" %s' % (ip, ts, req, code)))
+                break
+
+with io.open(os.path.join(outd, 'web_log_ioc.txt'), 'w', encoding='utf-8') as fo:
+    fo.write('Analisis jejak serangan di access log (maks %d MB terakhir per file, file 8 hari terakhir)\n' % (MAXB // 1048576))
+    fo.write('File dibaca: %s\n' % ('; '.join(scanned) if scanned else '(tidak ada)'))
+    fo.write('Total request terbaca: %d  rentang: %s .. %s\n\n' % (tot, first or '-', last or '-'))
+    fo.write('Top 15 IP sumber:\n')
+    for ip, c in topip.most_common(15):
+        fo.write('  %-40s %d\n' % (ip, c))
+    fo.write('\nPola serangan (jumlah / dijawab 2xx / IP teratas):\n')
+    for n, _, hi in CP:
+        s = stats[n]
+        if not s['n']:
+            continue
+        fo.write('  [%s] %-18s %6d  2xx=%-5d  %s\n' % ('TINGGI' if hi else 'info', n, s['n'], s['ok'],
+                                                       ', '.join('%s(%d)' % x for x in s['ip'].most_common(5))))
+        for e in s['ex']:
+            fo.write('        contoh 2xx: %s\n' % e)
+
+hi_ok = [(n, stats[n]) for n, _, h in CP if h and stats[n]['ok']]
+if hi_ok:
+    fnd('HIGH', 'IOC-WEB-01', 'IOC', 'Request serangan berisiko tinggi di access log dijawab 2xx (perlu investigasi)',
+        '; '.join('%s: %d x 2xx dari %s' % (n, s['ok'], ', '.join(ip for ip, _ in s['okip'].most_common(3))) for n, s in hi_ok),
+        'Periksa contoh di raw/web_log_ioc.txt dan log aplikasi backend pada jam yang sama. Respons 2xx belum tentu berhasil '
+        '(bisa halaman default), tapi wajib dipastikan. Blokir IP sumber bila bukan scanner resmi.')
+att = [(n, stats[n]['n']) for n, _, _ in CP if stats[n]['n']]
+if att:
+    fnd('INFO', 'IOC-WEB-02', 'IOC', 'Percobaan serangan/scan di access log', ', '.join('%s=%d' % x for x in att),
+        'Rincian & IP sumber di raw/web_log_ioc.txt. Pertimbangkan WAF/rate-limit bila volume tinggi.')
+
+# ------------------------------------------------------------------- output
+with io.open(os.path.join(outd, 'web_proxy_analysis.txt'), 'w', encoding='utf-8') as fo:
+    fo.write('Peta reverse proxy: instance | vhost | jenis | path depan | backend | akses | lokasi config\n')
+    fo.write('(pp = ProxyPass prefix, ppm = regex, exact = nginx location =, rw = RewriteRule [P])\n\n')
+    for r in ROWS:
+        fo.write(' | '.join(r) + '\n')
+
+
+def q(s):
+    s = ('%s' % s).replace('\r', '').replace('\n', ' | ').replace('"', '""')
+    if len(s) > 700:
+        s = s[:700] + '...'
+    return '"%s"' % s
+
+
+with io.open(find_out, 'a', encoding='utf-8') as fo:
+    for sev, cid, cat, title, ev, rec in FIND:
+        fo.write(','.join(q(x) for x in (host, cat, cid, sev, title, ev, rec)) + '\n')
+print('web-analyzer: %d instance, %d vhost, %d mapping, %d lokasi log, %d temuan' % (len(inst), len(VH), len(ROWS), len(ALOG), len(FIND)))
+PYEOF
+  cp "$OUT/.webfiles" "$RAW/web_config_files.txt" 2>/dev/null
+  cut -f1-3 "$OUT/.applogs" > "$RAW/app_log_targets.txt" 2>/dev/null
+  [ -s "$RAW/web_analyzer_errors.txt" ] || rm -f "$RAW/web_analyzer_errors.txt"
+  rm -f "$OUT/.webfiles" "$OUT/.applogs"
 }
 
 #------------------------------------------------------------------------------
@@ -1444,6 +2309,7 @@ check_java_common() { # $1=pid $2=kategori $3=label
   done
   [ -n "$exp" ] && finding LOW JAVA-PORT-01 "$cat" "Port aplikasi bisa diakses langsung dari jaringan (bisa mem-bypass proxy)" "$label:$exp" \
     "Jika aplikasi diakses lewat reverse proxy, bind ke localhost/IP internal atau batasi port hanya dari IP proxy."
+  [ "$cat" = SpringBoot ] || app_log_targets "$pid" "$label"
 }
 
 analyze_spring_config() { # $1=file gabungan config, $2=label
@@ -1594,6 +2460,7 @@ check_springboot() {
   [ -f "$jar" ] && { run_path "$jar"; scan_app_archive "$jar" "$base" "$cfg"; }
   for d in $(classpath_dirs "$pid"); do run_path "$d"; scan_lib_dir "$d" "$base"; done
   spring_external_config "$pid" "$cfg"
+  app_log_targets "$pid" "$base" "$cfg"
   finish_spring_config "$cfg" "$base"
   probe_actuator "$pid" "$base"
 }
@@ -1910,7 +2777,7 @@ scan_app_dir() {
     else
       basename "$f" >> "$loose"; reg_archive "$label/lib" "$f"; collect_artifact "$f" "$label/lib"
     fi
-  done < <(find "$d" -maxdepth 4 -type f \( -name '*.jar' -o -name '*.war' -o -name '*.ear' \) 2>/dev/null | head -n 3000)
+  done < <(find "$d" -maxdepth 4 -type f \( -name '*.jar' -o -name '*.war' -o -name '*.ear' -o -iname '*.jar[._-]*' -o -iname '*.war[._-]*' -o -iname '*.ear[._-]*' \) 2>/dev/null | filter_archives | head -n 3000)
   find "$d" -maxdepth 3 -type f \( -name 'application*.properties' -o -name 'application*.yml' -o -name 'application*.yaml' \
        -o -name 'bootstrap*.properties' -o -name 'bootstrap*.yml' \) 2>/dev/null | while read -r f; do
     echo "##### $f"; cat "$f"; echo
@@ -2379,7 +3246,7 @@ package_output() {
 # DETEKSI PERAN SERVER & EKSEKUSI
 #------------------------------------------------------------------------------
 detect_and_check_roles() {
-  pgrep -x httpd  >/dev/null 2>&1 && { ROLES="$ROLES apache"; check_apache; }
+  { pgrep -x httpd || pgrep -x apache2; } >/dev/null 2>&1 && { ROLES="$ROLES apache"; check_apache; }
   pgrep -x nginx  >/dev/null 2>&1 && { ROLES="$ROLES nginx";  check_nginx; }
   if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then ROLES="$ROLES mariadb"; check_mariadb; fi
   if pgrep -x postmaster >/dev/null 2>&1 || pgrep -x postgres >/dev/null 2>&1; then ROLES="$ROLES postgresql"; check_postgres; fi
@@ -2401,6 +3268,7 @@ detect_and_check_roles() {
         fi ;;
     esac
   done
+  analyze_web_and_logs
 }
 
 write_summary() {
