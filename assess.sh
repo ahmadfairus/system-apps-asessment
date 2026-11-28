@@ -1,7 +1,7 @@
 #!/bin/bash
 #==============================================================================
 # assess.sh - Assessment keamanan server (READ-ONLY), SATU script SATU output
-# Versi : 4.7   Target: CentOS/RHEL 7 (juga RHEL/Rocky/Alma 8-9)
+# Versi : 4.8   Target: CentOS/RHEL 7 (juga RHEL/Rocky/Alma 8-9)
 # Cakupan: OS, SSH, akun, hardening, port, filesystem, Apache/Nginx, MariaDB/
 #          MySQL, PostgreSQL, WildFly/JBoss, Tomcat, Spring Boot, Java lain,
 #          inventaris SEMUA library Java di SELURUH disk (jar/war/ear, termasuk
@@ -47,7 +47,7 @@
 set -u
 umask 077
 
-SCRIPT_VERSION="4.7"
+SCRIPT_VERSION="4.8"
 APACHE_MIN="2.4.71"   # versi Apache aman minimal (untuk Apache hasil kompilasi sendiri); perbarui saat ada rilis keamanan
 OUTBASE="/tmp"
 SKIP_FS=0
@@ -989,6 +989,618 @@ check_accounts() {
 #------------------------------------------------------------------------------
 # 4. HARDENING SISTEM
 #------------------------------------------------------------------------------
+# Firewall host: dinilai dari aturan yang BERLAKU di kernel (nftables, mencakup firewalld & iptables-nft;
+# iptables-legacy untuk CentOS 7), per port yang listen: DIBLOK / DIBATASI (IP sumber) / TERBUKA UNTUK SEMUA.
+check_firewall() {
+  local fwd fwe nfa nfe ips ufw z zd="" ipt=0 nftc=0 res
+  fwd=$(systemctl is-active firewalld 2>/dev/null); fwe=$(systemctl is-enabled firewalld 2>/dev/null)
+  nfa=$(systemctl is-active nftables 2>/dev/null);  nfe=$(systemctl is-enabled nftables 2>/dev/null)
+  ips=$(systemctl is-enabled iptables 2>/dev/null)
+  ufw=""; command -v ufw >/dev/null 2>&1 && ufw=$(ufw status 2>/dev/null | head -n1)
+  {
+    echo "firewalld: ${fwd:-n/a} (${fwe:-n/a})  nftables.service: ${nfa:-n/a} (${nfe:-n/a})  iptables.service: ${ips:-n/a}  ufw: ${ufw:-n/a}"
+    if [ "$fwd" = active ]; then
+      echo; echo "### firewall-cmd --get-active-zones"; firewall-cmd --get-active-zones 2>&1
+      echo; echo "### firewall-cmd --list-all-zones"; firewall-cmd --list-all-zones 2>&1
+      for z in $(firewall-cmd --get-ipsets 2>/dev/null); do echo "ipset $z: $(firewall-cmd --info-ipset="$z" 2>/dev/null | grep -E 'entries')"; done
+      echo; echo "### firewall-cmd --get-policies"; firewall-cmd --get-policies 2>&1
+    fi
+    if command -v nft >/dev/null 2>&1; then echo; echo "### nft list ruleset"; nft list ruleset 2>&1; fi
+    echo; echo "### iptables -S"; iptables -S 2>&1
+    if command -v iptables-legacy >/dev/null 2>&1; then echo; echo "### iptables-legacy -S"; iptables-legacy -S 2>&1; fi
+    echo; echo "### ip6tables -S"; ip6tables -S 2>&1
+    [ -n "$ufw" ] && { echo; echo "### ufw status verbose"; ufw status verbose 2>&1; }
+    [ -f /etc/sysconfig/nftables.conf ] && { echo; echo "### /etc/sysconfig/nftables.conf (+ include)"; grep -vE '^\s*(#|$)' /etc/sysconfig/nftables.conf
+      grep -oE 'include "[^"]+"' /etc/sysconfig/nftables.conf | cut -d'"' -f2 | while read -r z; do for f in $z; do [ -f "$f" ] && { echo "## $f"; grep -vE '^\s*(#|$)' "$f"; }; done; done; }
+  } > "$RAW/firewall.txt" 2>/dev/null
+  # runtime vs permanent firewalld (perubahan yang belum disimpan hilang saat reload/reboot)
+  if [ "$fwd" = active ]; then
+    for z in $(firewall-cmd --get-active-zones 2>/dev/null | grep -vE '^[[:space:]]'); do
+      diff -q <(firewall-cmd --zone="$z" --list-all 2>/dev/null | tail -n +2 | grep -vE '^\s*interfaces:') \
+              <(firewall-cmd --permanent --zone="$z" --list-all 2>/dev/null | tail -n +2 | grep -vE '^\s*interfaces:') >/dev/null 2>&1 || zd="$zd $z"
+    done
+  fi
+  : > "$OUT/.fwports"
+  command -v nft >/dev/null 2>&1 && nft -j list ruleset > "$OUT/.nft.json" 2>/dev/null
+  iptables -S > "$OUT/.ipt" 2>/dev/null
+  if command -v iptables-legacy >/dev/null 2>&1; then iptables-legacy -S > "$OUT/.iptl" 2>/dev/null; else : > "$OUT/.iptl"; fi
+  # CentOS 7: iptables = legacy; jangan dihitung dua kali
+  cmp -s "$OUT/.ipt" "$OUT/.iptl" && : > "$OUT/.iptl"
+  ss -tulnpH > "$OUT/.ss" 2>/dev/null || ss -tulnp | tail -n +2 > "$OUT/.ss"
+  printf 'firewalld=%s\nfirewalld_enabled=%s\nnftables=%s\nnftables_enabled=%s\niptables_svc=%s\nufw=%s\nfwd_diff=%s\nfwd_diff_zones=%s\n' \
+    "${fwd:-n/a}" "${fwe:-n/a}" "${nfa:-n/a}" "${nfe:-n/a}" "${ips:-n/a}" "${ufw:-n/a}" "$([ -n "$zd" ] && echo 1 || echo 0)" "$zd" > "$OUT/.fwinfo"
+  if [ -n "$PY" ]; then
+    res=$(timeout 120 "$PY" - "$HOST" "$OUT/.nft.json" "$OUT/.iptl" "$OUT/.ipt" "$OUT/.ss" "$OUT/.fwinfo" "$RAW" "$FINDINGS" "$OUT/.fwports" 2>>"$RAW/firewall_analyzer_errors.txt" <<'FWEOF'
+# -*- coding: utf-8 -*-
+# Evaluasi aturan firewall yang BERLAKU di kernel (nftables JSON + iptables-legacy) per port yang listen.
+# argv: host nft_json ipt_legacy ipt_nft ss_file fwinfo outdir findings_csv ports_out
+from __future__ import print_function, unicode_literals
+import sys, io, json, re, collections
+
+host, nftf, iplf, ipnf, ssf, infof, outd, find_out, ports_out = sys.argv[1:10]
+FIND = []
+
+
+def fnd(sev, cid, title, ev, rec):
+    FIND.append((sev, cid, 'Hardening', title, ev, rec))
+
+
+def rd(p):
+    try:
+        return io.open(p, encoding='utf-8', errors='replace').read()
+    except Exception:
+        return ''
+
+
+INFO = dict(l.split('=', 1) for l in rd(infof).split('\n') if '=' in l)
+
+# ------------------------------------------------------------------ model
+# rule = {'c': [cond...], 'v': verdict, 'u': bool(unknown matcher)}
+# cond = (kind, neg, value); kind: proto, dport, saddr, iif, ct
+# verdict = ('accept',) ('drop',) ('jump', chain) ('goto', chain) ('return',) None(counter/log)
+
+
+class Ruleset(object):
+    def __init__(self, name):
+        self.name = name
+        self.chains = collections.OrderedDict()   # key -> [rule]
+        self.base = []                            # (key, policy, family)
+        self.sets = {}
+
+
+def port_items(v, sets, tbl):
+    """Nilai dport nft -> list (lo, hi) atau None bila tidak bisa diketahui."""
+    if isinstance(v, int):
+        return [(v, v)]
+    if isinstance(v, str):
+        if v.startswith('@'):
+            el = sets.get((tbl, v[1:]))
+            if el is None:
+                return None
+            return port_items({'set': el}, sets, tbl)
+        if v.isdigit():
+            return [(int(v), int(v))]
+        m = {'ssh': 22, 'http': 80, 'https': 443, 'domain': 53, 'snmp': 161, 'ntp': 123}.get(v)
+        return [(m, m)] if m else None
+    if isinstance(v, dict):
+        if 'range' in v:
+            a, b = v['range']
+            return [(int(a), int(b))]
+        if 'set' in v:
+            out = []
+            for x in v['set']:
+                r = port_items(x, sets, tbl)
+                if r is None:
+                    return None
+                out += r
+            return out
+        if 'prefix' in v:
+            return None
+    if isinstance(v, list):
+        return port_items({'set': v}, sets, tbl)
+    return None
+
+
+def addr_text(v, sets, tbl):
+    if isinstance(v, str):
+        if v.startswith('@'):
+            el = sets.get((tbl, v[1:]))
+            return '%s{%s}' % (v, ','.join(addr_text(x, sets, tbl) for x in (el or [])[:8]))
+        return v
+    if isinstance(v, dict):
+        if 'prefix' in v:
+            return '%s/%s' % (v['prefix']['addr'], v['prefix']['len'])
+        if 'range' in v:
+            return '%s-%s' % tuple(v['range'])
+        if 'set' in v:
+            return ','.join(addr_text(x, sets, tbl) for x in v['set'][:8])
+    return json.dumps(v)
+
+
+def as_list(v):
+    if isinstance(v, dict) and 'set' in v:
+        return [x if isinstance(x, str) else json.dumps(x) for x in v['set']]
+    if isinstance(v, list):
+        return [x if isinstance(x, str) else json.dumps(x) for x in v]
+    return [v if isinstance(v, str) else json.dumps(v)]
+
+
+def verdict_of(e):
+    for k in ('accept', 'drop', 'reject', 'return'):
+        if k in e:
+            return ('drop',) if k == 'reject' else (k,)
+    for k in ('jump', 'goto'):
+        if k in e:
+            return (k, e[k]['target'])
+    return None
+
+
+def load_nft(p):
+    try:
+        d = json.loads(rd(p))['nftables']
+    except Exception:
+        return None
+    rs = Ruleset('nftables')
+    for o in d:
+        if 'set' in o:
+            s = o['set']
+            rs.sets[(s['family'], s['table'], s['name'])] = s.get('elem', [])
+        elif 'map' in o:
+            s = o['map']
+            rs.sets[(s['family'], s['table'], s['name'])] = s.get('elem', [])
+    for o in d:
+        if 'chain' in o:
+            c = o['chain']
+            key = (c['family'], c['table'], c['name'])
+            rs.chains.setdefault(key, [])
+            if c.get('hook') == 'input' and c.get('type', 'filter') == 'filter':
+                rs.base.append((key, c.get('policy', 'accept'), c['family']))
+    for o in d:
+        if 'rule' not in o:
+            continue
+        r = o['rule']
+        fam, tbl = r['family'], r['table']
+        key = (fam, tbl, r['chain'])
+        sets = dict(((t, n), v) for (f, t, n), v in rs.sets.items() if f == fam)
+        conds, unk, v, extra = [], False, None, []
+        for e in r.get('expr', []):
+            if 'match' in e:
+                m = e['match']
+                left, right, op = m.get('left'), m.get('right'), m.get('op', '==')
+                neg = op == '!='
+                if not isinstance(left, dict):
+                    unk = True
+                    continue
+                if 'payload' in left:
+                    pl = left['payload']
+                    proto, field = pl.get('protocol'), pl.get('field')
+                    if field == 'dport' and proto in ('tcp', 'udp', 'th', 'sctp'):
+                        if proto != 'th':
+                            conds.append(('proto', False, [proto]))
+                        conds.append(('dport', neg, port_items(right, sets, tbl)))
+                    elif field == 'saddr' and proto in ('ip', 'ip6'):
+                        conds.append(('saddr', neg, addr_text(right, sets, tbl)))
+                        if proto == 'ip6':
+                            conds.append(('fam6', False, None))
+                    elif field == 'daddr' and proto in ('ip', 'ip6'):
+                        dt = addr_text(right, sets, tbl)
+                        if dt.startswith('127.') or dt == '::1':
+                            conds.append(('never', False, None))
+                    elif field == 'sport':
+                        conds.append(('never', False, None)) if not neg else None
+                    elif proto in ('icmp', 'icmpv6') or field in ('type', 'code'):
+                        conds.append(('never', False, None))
+                    else:
+                        unk = True
+                elif 'meta' in left:
+                    k = left['meta'].get('key')
+                    if k in ('iifname', 'iif'):
+                        conds.append(('iif', neg, as_list(right)))
+                    elif k == 'l4proto':
+                        conds.append(('proto', neg, as_list(right)))
+                    elif k == 'nfproto':
+                        if 'ipv6' in as_list(right) and not neg:
+                            conds.append(('fam6', False, None))
+                    elif k in ('pkttype',):
+                        conds.append(('never', False, None)) if 'unicast' not in as_list(right) else None
+                    else:
+                        unk = True
+                elif 'ct' in left:
+                    k = left['ct'].get('key')
+                    if k == 'state':
+                        conds.append(('ct', neg, as_list(right)))
+                    else:
+                        unk = True
+                elif 'fib' in left:
+                    conds.append(('never', False, None))     # rpfilter: tidak berlaku untuk paket normal
+                else:
+                    unk = True
+            elif 'vmap' in e:
+                vm = e['vmap']
+                k = vm.get('key', {})
+                data = vm.get('data', {})
+                items = data.get('set', []) if isinstance(data, dict) else []
+                if isinstance(data, str) and data.startswith('@'):
+                    items = sets.get((tbl, data[1:]), [])
+                if 'ct' in k and k['ct'].get('key') == 'state':
+                    for it in items:
+                        ks, vd = it[0], verdict_of(it[1]) if isinstance(it[1], dict) else None
+                        for st in as_list(ks):
+                            if st in ('new', 'untracked') and vd:
+                                extra.append({'c': conds + [('ct', False, [st])], 'v': vd, 'u': unk})
+                    v = None
+                elif 'meta' in k and k['meta'].get('key') in ('iifname', 'iif'):
+                    for it in items:
+                        vd = verdict_of(it[1]) if isinstance(it[1], dict) else None
+                        if vd:
+                            extra.append({'c': conds + [('iif', False, as_list(it[0]))], 'v': vd, 'u': unk})
+                elif 'payload' in k and k['payload'].get('field') == 'dport':
+                    for it in items:
+                        vd = verdict_of(it[1]) if isinstance(it[1], dict) else None
+                        pi = port_items(it[0], sets, tbl)
+                        if vd:
+                            extra.append({'c': conds + [('dport', False, pi)], 'v': vd, 'u': unk})
+                else:
+                    unk = True
+            else:
+                vd = verdict_of(e)
+                if vd:
+                    v = vd
+        lst = rs.chains.setdefault(key, [])
+        if extra:
+            lst.extend(extra)
+        elif v is not None:
+            lst.append({'c': conds, 'v': v, 'u': unk})
+    return rs
+
+
+def load_ipt(text, name):
+    rs = Ruleset(name)
+    pol = {}
+    for ln in text.split('\n'):
+        t = ln.split()
+        if not t:
+            continue
+        if t[0] == '-P' and len(t) >= 3:
+            pol[t[1]] = t[2].lower()
+            rs.chains.setdefault(('ip', 'filter', t[1]), [])
+            continue
+        if t[0] == '-N':
+            rs.chains.setdefault(('ip', 'filter', t[1]), [])
+            continue
+        if t[0] != '-A' or len(t) < 2:
+            continue
+        key = ('ip', 'filter', t[1])
+        conds, unk, v, i, neg = [], False, None, 2, False
+        while i < len(t):
+            a = t[i]
+            nx = t[i + 1] if i + 1 < len(t) else ''
+            if a == '!':
+                neg = True
+                i += 1
+                continue
+            if a in ('-p', '--protocol'):
+                if nx not in ('all', '0'):
+                    conds.append(('proto', neg, [nx]))
+                i += 2
+            elif a in ('-s', '--source'):
+                conds.append(('saddr', neg, nx))
+                i += 2
+            elif a in ('-d', '--destination'):
+                if nx.startswith('127.'):
+                    conds.append(('never', False, None))
+                i += 2
+            elif a in ('-i', '--in-interface'):
+                conds.append(('iif', neg, [nx.rstrip('+')]))
+                i += 2
+            elif a in ('--dport', '--destination-port', '--dports', '--destination-ports'):
+                items = []
+                for x in nx.split(','):
+                    if ':' in x:
+                        lo, hi = x.split(':')
+                        items.append((int(lo or 0), int(hi or 65535)))
+                    elif x.isdigit():
+                        items.append((int(x), int(x)))
+                    else:
+                        items = None
+                        break
+                conds.append(('dport', neg, items))
+                i += 2
+            elif a in ('--state', '--ctstate'):
+                conds.append(('ct', neg, [x.lower() for x in nx.split(',')]))
+                i += 2
+            elif a == '--match-set' and i + 2 < len(t):
+                if t[i + 2].startswith('src'):
+                    conds.append(('saddr', neg, 'ipset:' + nx))
+                else:
+                    unk = True
+                i += 3
+            elif a in ('-j', '-g', '--jump', '--goto'):
+                tg = nx.upper() if nx.upper() in ('ACCEPT', 'DROP', 'REJECT', 'RETURN') else nx
+                if tg in ('ACCEPT',):
+                    v = ('accept',)
+                elif tg in ('DROP', 'REJECT'):
+                    v = ('drop',)
+                elif tg == 'RETURN':
+                    v = ('return',)
+                elif tg in ('LOG', 'MARK', 'CONNMARK', 'NOTRACK', 'CT', 'AUDIT', 'NFLOG'):
+                    v = None
+                else:
+                    v = ('goto' if a in ('-g', '--goto') else 'jump', tg)
+                i += 2
+                # sisa argumen target (mis. --reject-with) diabaikan
+                while i < len(t) and not t[i].startswith(('-j', '-g')) and t[i].startswith('--') and t[i] not in ('--dport', '--dports'):
+                    i += 2
+            elif a in ('-m', '--match'):
+                if nx not in ('tcp', 'udp', 'state', 'conntrack', 'multiport', 'set', 'comment', 'icmp'):
+                    if nx in ('addrtype', 'pkttype', 'limit', 'hashlimit', 'recent', 'mac', 'iprange', 'owner', 'string', 'mark', 'connlimit'):
+                        unk = True
+                if nx == 'icmp':
+                    conds.append(('never', False, None))
+                i += 2
+            elif a in ('--comment',):
+                i += 2
+            elif a.startswith('--'):
+                if a in ('--icmp-type', '--tcp-flags', '--syn'):
+                    if a == '--tcp-flags':
+                        i += 3
+                        continue
+                    i += 1 if a == '--syn' else 2
+                    continue
+                unk = True
+                i += 2 if (nx and not nx.startswith('-')) else 1
+            else:
+                i += 1
+            neg = False
+        rs.chains.setdefault(key, [])
+        if v is not None:
+            rs.chains[key].append({'c': conds, 'v': v, 'u': unk})
+    if 'INPUT' in pol or ('ip', 'filter', 'INPUT') in rs.chains:
+        rs.base.append((('ip', 'filter', 'INPUT'), pol.get('INPUT', 'accept'), 'ip'))
+    return rs
+
+
+# ------------------------------------------------------------ evaluasi
+def in_ports(items, port):
+    return any(lo <= port <= hi for lo, hi in items)
+
+
+def rule_match(r, proto, port):
+    """'no' / 'yes' / 'src' (hanya untuk sumber tertentu) / 'unk'."""
+    src = None
+    for kind, neg, val in r['c']:
+        if kind == 'never':
+            return 'no', None
+        if kind == 'fam6':
+            return 'no', None
+        if kind == 'proto':
+            ok = proto in val or ('th' in val)
+            if ok == neg:
+                return 'no', None
+        elif kind == 'dport':
+            if val is None:
+                return 'unk', None
+            ok = in_ports(val, port)
+            if ok == neg:
+                return 'no', None
+        elif kind == 'iif':
+            islo = any(x in ('lo',) for x in val)
+            if islo and not neg:
+                return 'no', None
+        elif kind == 'ct':
+            ok = any(x in ('new', 'untracked') for x in val)
+            if ok == neg:
+                return 'no', None
+        elif kind == 'saddr':
+            if not neg:
+                src = val
+    if r['u']:
+        return 'unk', src
+    return ('src', src) if src else ('yes', None)
+
+
+def eval_chain(rs, key, proto, port, restricted, depth=0, ctx_src=None):
+    """Hasil untuk sumber umum: 'accept'/'drop'/None(lanjut) dan mengisi restricted/uncertain."""
+    if depth > 30:
+        return None
+    for r in rs.chains.get(key, []):
+        m, src = rule_match(r, proto, port)
+        if m == 'no':
+            continue
+        if m == 'unk':
+            restricted['unk'] = True
+            continue
+        v = r['v']
+        if m == 'src' or ctx_src:
+            s = src or ctx_src
+            if v[0] == 'accept':
+                restricted['src'].append(s)
+            elif v[0] in ('jump', 'goto'):
+                eval_chain(rs, (key[0], key[1], v[1]), proto, port, restricted, depth + 1, s)
+            continue
+        if v[0] == 'accept':
+            return 'accept'
+        if v[0] == 'drop':
+            return 'drop'
+        if v[0] == 'return':
+            return None
+        if v[0] in ('jump', 'goto'):
+            res = eval_chain(rs, (key[0], key[1], v[1]), proto, port, restricted, depth + 1)
+            if res in ('accept', 'drop'):
+                return res
+            if v[0] == 'goto':
+                return 'end'
+    return None
+
+
+def eval_port(rsets, proto, port):
+    """Gabungkan semua base chain input (semua tabel): drop di salah satu = diblok."""
+    status, srcs, unk, any_chain = 'open', [], False, False
+    for rs in rsets:
+        for key, pol, fam in rs.base:
+            if fam == 'ip6':
+                continue
+            any_chain = True
+            rr = {'src': [], 'unk': False}
+            res = eval_chain(rs, key, proto, port, rr)
+            if res in (None, 'end'):
+                res = 'accept' if pol == 'accept' else 'drop'
+            unk = unk or rr['unk']
+            if res == 'drop':
+                if rr['src']:
+                    if status != 'blocked':
+                        status = 'restricted'
+                    srcs += rr['src']
+                else:
+                    status = 'blocked'
+    if not any_chain:
+        return 'nofw', [], False
+    return status, sorted(set(srcs)), unk
+
+
+def has_filtering(rs):
+    for key, pol, fam in rs.base:
+        if pol == 'drop':
+            return True
+        stack, seen = [key], set()
+        while stack:
+            k = stack.pop()
+            if k in seen:
+                continue
+            seen.add(k)
+            for r in rs.chains.get(k, []):
+                if r['v'][0] == 'drop':
+                    return True
+                if r['v'][0] in ('jump', 'goto'):
+                    stack.append((k[0], k[1], r['v'][1]))
+    return False
+
+
+# ------------------------------------------------------------------ jalankan
+rsets, used = [], []
+nrs = load_nft(nftf) if nftf and rd(nftf).strip() else None
+if nrs is not None and nrs.base:
+    rsets.append(nrs)
+    used.append('nftables (kernel, mencakup firewalld/iptables-nft)')
+elif rd(ipnf).strip():
+    r = load_ipt(rd(ipnf), 'iptables')
+    if r.base and (r.chains.get(('ip', 'filter', 'INPUT')) or r.base[0][1] != 'accept'):
+        rsets.append(r)
+        used.append('iptables')
+leg = rd(iplf)
+if leg.strip():
+    r = load_ipt(leg, 'iptables-legacy')
+    if r.chains.get(('ip', 'filter', 'INPUT')) or (r.base and r.base[0][1] != 'accept'):
+        rsets.append(r)
+        used.append('iptables-legacy')
+
+filt = [rs for rs in rsets if has_filtering(rs)]
+
+# port listen
+LS = []
+for ln in rd(ssf).split('\n'):
+    t = ln.split()
+    if len(t) < 5 or t[0] not in ('tcp', 'udp'):
+        continue
+    loc = t[4]
+    addr, _, port = loc.rpartition(':')
+    if not port.isdigit():
+        continue
+    a = addr.strip('[]').split('%')[0]
+    if a.startswith('127.') or a == '::1':
+        continue
+    proc = re.search(r'\(\("([^"]+)"', ln)
+    LS.append((t[0], int(port), a or '*', proc.group(1) if proc else '?'))
+LS = sorted(set(LS), key=lambda x: (x[0], x[1]))
+
+rows, openp, restr, unkp = [], [], [], []
+PORTS = []
+for proto, port, addr, proc in LS:
+    if not filt:
+        st, srcs, unk = 'open', [], False
+    else:
+        st, srcs, unk = eval_port(filt, proto, port)
+    label = {'open': 'TERBUKA UNTUK SEMUA', 'restricted': 'DIBATASI', 'blocked': 'DIBLOK', 'nofw': 'TANPA FIREWALL'}[st]
+    note = (' sumber: ' + ', '.join(srcs)[:200]) if srcs else ''
+    if unk:
+        note += ' (ada aturan yang tidak bisa dinilai otomatis: perkiraan)'
+    rows.append('%-4s %-6d %-22s %-14s %s%s' % (proto, port, addr, proc[:14], label, note))
+    PORTS.append('%s %d %s' % (proto, port, st))
+    if st == 'open' and filt:
+        openp.append('%s/%d (%s)' % (proto, port, proc))
+    elif st == 'restricted':
+        restr.append('%s/%d <- %s' % (proto, port, ', '.join(srcs)[:80]))
+    if unk:
+        unkp.append('%s/%d' % (proto, port))
+
+svc = ', '.join('%s=%s' % (k, INFO.get(k, '?')) for k in ('firewalld', 'firewalld_enabled', 'nftables', 'nftables_enabled', 'iptables_svc', 'ufw'))
+with io.open(outd + '/firewall_analysis.txt', 'w', encoding='utf-8') as fo:
+    fo.write('Analisis firewall host (aturan yang berlaku di kernel)\n')
+    fo.write('Sumber aturan : %s\n' % (', '.join(used) or '(tidak ada)'))
+    fo.write('Layanan       : %s\n' % svc)
+    fo.write('Ada filter    : %s\n\n' % ('YA' if filt else 'TIDAK (semua lalu lintas masuk diterima)'))
+    fo.write('Status port yang listen di interface jaringan (sumber umum = IP yang tidak ada di whitelist):\n')
+    fo.write('\n'.join(rows) + '\n' if rows else '(tidak ada port listen non-loopback)\n')
+    fo.write('\nCatatan: hanya chain input IPv4 yang dinilai; firewall jaringan (Palo Alto) di luar cakupan.\n')
+with io.open(ports_out, 'w', encoding='utf-8') as fo:
+    fo.write('\n'.join(PORTS) + '\n')
+
+if not filt:
+    fnd('MEDIUM', 'HRD-FW-01', 'Tidak ada host firewall yang memfilter lalu lintas masuk',
+        'sumber aturan diperiksa: %s; %s' % (', '.join(used) or 'nftables/iptables kosong', svc),
+        'Aktifkan firewalld (atau nftables) dengan default deny, lalu izinkan hanya port yang diperlukan dari IP sumber yang diperlukan (defense in depth di belakang Palo Alto).')
+else:
+    fnd('INFO', 'HRD-FW-00', 'Host firewall aktif', '%s; %d port dibatasi/diblok, %d terbuka untuk semua' % (', '.join(used), len(LS) - len(openp), len(openp)),
+        'Rincian per port di raw/firewall_analysis.txt.')
+    if openp:
+        fnd('MEDIUM', 'HRD-FW-02', 'Firewall aktif tetapi ada port yang terbuka untuk semua IP', '; '.join(openp[:15]),
+            'Batasi setiap port ke IP sumber yang membutuhkan (firewalld: rich rule source address=... port=...; hapus service/port umum dari zona; '
+            'nftables: tcp dport N ip saddr {..} accept + policy drop). SSH cukup dari jump host.')
+if unkp:
+    fnd('INFO', 'HRD-FW-04', 'Sebagian aturan firewall tidak bisa dinilai otomatis', ', '.join(unkp[:15]),
+        'Review manual raw/firewall.txt untuk port tersebut.')
+pers = []
+if INFO.get('firewalld') == 'active' and INFO.get('firewalld_enabled') not in ('enabled', 'static'):
+    pers.append('firewalld aktif tetapi tidak enabled (mati setelah reboot)')
+if INFO.get('fwd_diff') == '1':
+    pers.append('konfigurasi runtime firewalld berbeda dari permanent (perubahan hilang setelah reload/reboot): zona ' + INFO.get('fwd_diff_zones', ''))
+if filt and INFO.get('firewalld') != 'active' and INFO.get('nftables_enabled') != 'enabled' and INFO.get('iptables_svc') != 'enabled' and INFO.get('ufw', '').find('active') < 0:
+    pers.append('aturan ada di kernel tetapi tidak ada layanan firewall yang enabled (nftables/iptables/firewalld): aturan hilang setelah reboot')
+if pers:
+    fnd('LOW', 'HRD-FW-03', 'Aturan firewall tidak persisten', '; '.join(pers),
+        'firewalld: systemctl enable firewalld dan simpan perubahan dengan --permanent (atau firewall-cmd --runtime-to-permanent). '
+        'nftables: simpan ke /etc/sysconfig/nftables.conf lalu systemctl enable nftables.')
+
+
+def q(s):
+    s = ('%s' % s).replace('\r', '').replace('\n', ' | ').replace('"', '""')
+    return '"%s"' % (s[:700] + '...' if len(s) > 700 else s)
+
+
+with io.open(find_out, 'a', encoding='utf-8') as fo:
+    for sev, cid, cat, title, ev, rec in FIND:
+        fo.write(','.join(q(x) for x in (host, cat, cid, sev, title, ev, rec)) + '\n')
+print('fw-analyzer: %s; filter=%s; port=%d terbuka=%d dibatasi=%d' % (','.join(used) or '-', bool(filt), len(LS), len(openp), len(restr)))
+FWEOF
+)
+    log "  $res"
+    case "$res" in *filter=True*) FW_ON=1 ;; esac
+    [ -s "$RAW/firewall_analyzer_errors.txt" ] || rm -f "$RAW/firewall_analyzer_errors.txt"
+  else
+    ipt=$( { cat "$OUT/.ipt" "$OUT/.iptl"; } | grep -cE '^-A .*-j (DROP|REJECT)|^-P INPUT DROP')
+    command -v nft >/dev/null 2>&1 && nftc=$(nft list ruleset 2>/dev/null | grep -cE '\b(drop|reject)\b|policy drop')
+    if [ "${ipt:-0}" -gt 0 ] || [ "${nftc:-0}" -gt 0 ]; then FW_ON=1; else
+      finding MEDIUM HRD-FW-01 Hardening "Tidak ada host firewall yang memfilter lalu lintas masuk" \
+        "firewalld: ${fwd:-n/a}; nftables: ${nfa:-n/a}; aturan drop/reject iptables: ${ipt:-0}, nft: ${nftc:-0}" \
+        "Aktifkan firewalld (atau nftables) dengan default deny, lalu izinkan hanya port yang diperlukan dari IP sumber yang diperlukan."
+    fi
+  fi
+  rm -f "$OUT/.nft.json" "$OUT/.ipt" "$OUT/.iptl" "$OUT/.ss" "$OUT/.fwinfo"
+}
+
+# Status firewall untuk satu port tcp (blocked/restricted/open/kosong bila tidak diketahui)
+fw_port_status() { awk -v p="$1" '$1=="tcp" && $2==p {print $3; exit}' "$OUT/.fwports" 2>/dev/null; }
+
 check_hardening() {
   log "Cek hardening sistem"
   local se; se=$(getenforce 2>/dev/null)
@@ -997,15 +1609,7 @@ check_hardening() {
     Permissive) finding LOW HRD-SELINUX-01 Hardening "SELinux mode permissive" "getenforce: $se" "Analisis denial di audit.log lalu ubah ke enforcing." ;;
   esac
 
-  local fwd ipt
-  fwd=$(systemctl is-active firewalld 2>/dev/null)
-  ipt=$(iptables -S 2>/dev/null | grep -cvE '^-P')
-  { echo "firewalld: $fwd"; [ "$fwd" = active ] && firewall-cmd --list-all-zones 2>&1
-    echo; echo "### iptables -S"; iptables -S 2>&1; echo; echo "### ip6tables -S"; ip6tables -S 2>&1; } > "$RAW/firewall.txt"
-  if [ "$fwd" = active ] || [ "${ipt:-0}" -gt 0 ]; then FW_ON=1; else
-    finding MEDIUM HRD-FW-01 Hardening "Tidak ada host firewall aktif" "firewalld: ${fwd:-n/a}; aturan iptables: ${ipt:-0}" \
-      "Aktifkan firewalld dan izinkan hanya port yang diperlukan dari sumber yang diperlukan (defense in depth di belakang Palo Alto)."
-  fi
+  check_firewall
 
   local p bad=""
   for p in telnet-server rsh-server ypserv tftp-server vsftpd xinetd talk-server; do
@@ -1363,8 +1967,11 @@ check_nginx() {
 # Lokasi log aplikasi Java (logback/log4j2, logging.file.*, WildFly, Tomcat) -> $OUT/.applogs
 #   format: label<TAB>path<TAB>sumber<TAB>folder-kerja<TAB>properti(k=v;k=v)
 app_log_targets() { # $1=pid $2=label [$3=file config Spring gabungan]
-  local pid="$1" label="$2" cfg="${3:-}" cwd v f props
+  local pid="$1" label="$2" cfg="${3:-}" cwd v f props envp seenf=" "
   cwd=$(pid_cwd "$pid")
+  # variabel path log dari env proses & -D (nama yang mengandung LOG/DIR/PATH/HOME saja, tanpa secret)
+  envp=$( { tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null; pid_cmd "$pid" | tr ' ' '\n' | sed -n 's/^-D\([A-Za-z0-9_.]*=.*\)/\1/p'; } \
+          | grep -E '^[A-Za-z0-9_.]*(LOG|DIR|PATH|HOME)[A-Za-z0-9_.]*=' | grep -viE '^[^=]*(pass|secret|token|key|cred)' | sed 's/^/env:/' | tr '\n' ';')
   {
     v=$(arg_val "$pid" -Djboss.server.log.dir)
     if [ -n "$v" ]; then printf '%s\t%s/*\t-Djboss.server.log.dir\t%s\t\n' "$label" "$v" "$cwd"
@@ -1387,6 +1994,9 @@ app_log_targets() { # $1=pid $2=label [$3=file config Spring gabungan]
       [ -n "$f" ] || continue
       [ "${f#/}" = "$f" ] && f="$cwd/$f"
       [ -f "$f" ] || continue
+      f=$(readlink -f "$f")
+      case "$seenf" in *" $f "*) continue ;; esac
+      seenf="$seenf$f "
       { echo "##### $label: $f"; redact < "$f"; echo; } >> "$RAW/app_log_configs.txt"
       props=$(grep -oE '<property[^>]+name="[^"]+"[^>]+value="[^"]+"' "$f" | sed -E 's/.*name="([^"]+)".*value="([^"]+)".*/\1=\2/' | tr '\n' ';')
       props="$props$(grep -oE '<Property name="[^"]+">[^<]+' "$f" | sed -E 's/<Property name="([^"]+)">/\1=/' | tr '\n' ';')"
@@ -1395,7 +2005,7 @@ app_log_targets() { # $1=pid $2=label [$3=file config Spring gabungan]
         grep -E '^\s*log4j\.appender\.[^.]+\.File\s*=' "$f" | sed -E 's/^[^=]*=[[:space:]]*//'; } | while read -r v; do
         printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$v" "$(basename "$f")" "$cwd" "$props"; done
     done
-  } >> "$OUT/.applogs" 2>/dev/null
+  } 2>/dev/null | awk -F'\t' -v e="$envp" 'BEGIN{OFS="\t"} {$5 = e (NF>=5 ? $5 : ""); if (!s[$0]++) print}' >> "$OUT/.applogs"
   return 0
 }
 
@@ -1899,16 +2509,29 @@ def resolve_app(path, cwd, props):
     for kv in props.split(';'):
         if '=' in kv:
             k, v = kv.split('=', 1)
-            pr[k.strip()] = v.strip()
+            k = k.strip()
+            if k.startswith('env:'):
+                pr[k] = v.strip()
+            else:
+                pr.setdefault(k, v.strip())
+    for k in [x for x in pr if x.startswith('env:')]:
+        pr[k[4:]] = pr[k]          # env/-D mengalahkan <property> dan default
     for _ in range(5):
         m = re.search(r'\$\{([^}:]+)(:-([^}]*))?\}', path)
         if not m:
             break
         k, dflt = m.group(1), m.group(3)
-        val = pr.get(k, pr.get(k.lower(), dflt))
+        val = pr.get(k, pr.get(k.lower()))
+        if val is not None and '${' + k in val:      # <property name="X" value="${X:-default}"/>
+            mm = re.search(r'\$\{' + re.escape(k) + r':-([^}]*)\}', val)
+            val = pr.get('env:' + k) or (mm.group(1) if mm else None)
+        if val is None:
+            val = pr.get('env:' + k, dflt)
         if val is None:
             return None
         path = path[:m.start()] + val + path[m.end():]
+    if '${' in path:
+        return None
     path = re.sub(r'%d\{[^}]*\}|%i|%d', '*', path)
     if not path.startswith('/'):
         path = os.path.join(cwd or '/', path)
@@ -1927,27 +2550,32 @@ if os.path.exists(applogs):
         ALOG.append((p[0], 'app', rp, '', p[2] or '-'))
 
 stat_out = []
-ww, missing, full, common_fmt, stale = [], [], [], [], []
+ww, missing, full, common_fmt, stale, missing_app = [], [], [], [], [], []
 acc_files = []
-done = set()
+GRP = collections.OrderedDict()   # (kind, label, folder) -> template, file, sumber, format
 for label, kind, tpl, fmt, src in ALOG:
-    g = strf_glob(tpl)
-    if g == tpl and kind != 'app':
-        g = tpl + '*'
-    elif g == tpl:
-        g = tpl + '*'
     if os.path.isdir(tpl):
-        g = os.path.join(tpl, '*')
-    key = (g, kind)
-    if key in done:
-        continue
-    done.add(key)
-    fl = [x for x in glob.glob(g)[:20000] if os.path.isfile(x)]
-    dirn = os.path.dirname(tpl) if not os.path.isdir(tpl) else tpl
+        g, dirn = os.path.join(tpl, '*'), tpl
+    else:
+        g = strf_glob(tpl)
+        g = g if g != tpl else tpl + '*'
+        dirn = os.path.dirname(tpl)
+    e = GRP.setdefault((kind, label, dirn), {'tpl': [], 'files': set(), 'src': [], 'fmt': fmt})
+    if tpl not in e['tpl']:
+        e['tpl'].append(tpl)
+    if src not in e['src']:
+        e['src'].append(src)
+    if os.path.isdir(dirn):
+        e['files'].update(x for x in glob.glob(g)[:20000] if os.path.isfile(x))
+
+for (kind, label, dirn), e in GRP.items():
+    tpls = '\n              '.join(e['tpl'][:12]) + ('\n              ... (+%d)' % (len(e['tpl']) - 12) if len(e['tpl']) > 12 else '')
     if not os.path.isdir(dirn):
-        missing.append('%s (%s, %s)' % (tpl, label, src))
-        stat_out.append('%-8s %s\n   template : %s\n   sumber   : %s\n   status   : FOLDER TIDAK ADA\n' % (kind, label, tpl, src))
+        (missing_app if kind == 'app' else missing).append('%s (%s, %s)' % (e['tpl'][0], label, e['src'][0]))
+        stat_out.append('%-8s %s\n   folder   : %s  -> FOLDER TIDAK ADA\n   template : %s\n   sumber   : %s\n' % (
+            kind, label, dirn, tpls, ', '.join(e['src'])))
         continue
+    fl = sorted(e['files'])
     tot = sum(os.path.getsize(x) for x in fl)
     mt = sorted((os.path.getmtime(x), x) for x in fl)
     nww = [x for x in fl if os.stat(x).st_mode & 0o004]
@@ -1957,23 +2585,26 @@ for label, kind, tpl, fmt, src in ALOG:
     except Exception:
         used = -1
     try:
-        dm = oct(os.stat(dirn).st_mode & 0o777)[-3:]
+        ds = os.stat(dirn)
+        dm = oct(ds.st_mode & 0o777)[-3:]
     except Exception:
         dm = '?'
     newest = (NOW - mt[-1][0]) / 86400 if mt else None
     oldest = (NOW - mt[0][0]) / 86400 if mt else None
-    stat_out.append('%-8s %s\n   template : %s\n   sumber   : %s\n   folder   : %s (mode %s, disk terpakai %s%%)\n'
-                    '   file     : %d, total %.1f MB, terbaru %s hari lalu, tertua %s hari lalu, terbaca-semua-user: %d\n' % (
-                        kind, label, tpl, src, dirn, dm, used, len(fl), tot / 1048576.0,
-                        '%.1f' % newest if newest is not None else '-', '%.0f' % oldest if oldest is not None else '-', len(nww)))
+    stat_out.append('%-8s %s\n   folder   : %s (mode %s, disk terpakai %s%%)\n   file     : %d, total %.1f MB, terbaru %s hari lalu, '
+                    'tertua %s hari lalu, terbaca-semua-user: %d\n   template : %s\n   sumber   : %s\n' % (
+                        kind, label, dirn, dm, used, len(fl), tot / 1048576.0,
+                        '%.1f' % newest if newest is not None else '-', '%.0f' % oldest if oldest is not None else '-',
+                        len(nww), tpls, ', '.join(e['src'])))
     if nww and not any(x.startswith(dirn + ' (') for x in ww):
         ww.append('%s (%d file)' % (dirn, len(nww)))
     if used >= 85 and not any(x.startswith(dirn + ' ') for x in full):
         full.append('%s %d%%' % (dirn, used))
+    fmt = e['fmt']
     if kind == 'access' and (fmt.lower() == 'common' or (fmt and '%' in fmt and 'User-Agent' not in fmt)):
-        common_fmt.append('%s (%s)' % (label, src))
+        common_fmt.append('%s (%s)' % (label, e['src'][0]))
     if kind == 'access' and newest is not None and newest > 2:
-        stale.append('%s: terakhir %.0f hari lalu' % (tpl, newest))
+        stale.append('%s: terakhir %.0f hari lalu' % (dirn, newest))
     if kind == 'access':
         acc_files += [x for t, x in mt if NOW - t < 8 * 86400]
 
@@ -1991,6 +2622,9 @@ if full:
 if missing:
     fnd('LOW', 'LOG-MISS-01', 'Log', 'Lokasi log di konfigurasi tidak ada', '; '.join(missing[:8]),
         'Perbaiki path log; tanpa log tidak ada jejak untuk investigasi insiden.')
+if missing_app:
+    fnd('INFO', 'LOG-MISS-02', 'Log', 'Folder log aplikasi di logback/log4j belum ada', '; '.join(missing_app[:8]),
+        'Biasanya appender belum pernah menulis. Bila log itu penting (audit/transaksi), pastikan folder ada dan bisa ditulis user aplikasi.')
 if common_fmt:
     fnd('LOW', 'LOG-FMT-01', 'Log', 'Access log memakai format tanpa User-Agent/Referer', '; '.join(common_fmt[:6]),
         'Pakai format combined (Apache: LogFormat combined/combined_tls) agar log berguna untuk investigasi.')
@@ -2136,8 +2770,9 @@ check_mariadb() {
 
   for addr in $(listen_of_pid "$pid"); do is_loopback "${addr%:*}" || exp="$exp $addr"; done
   if [ -n "$exp" ]; then
-    if [ "$FW_ON" -eq 1 ]; then d=LOW; else d=MEDIUM; fi
-    finding "$d" DB-LISTEN-01 MariaDB "Database listen di interface jaringan" "listen:$exp; host firewall aktif=$FW_ON" \
+    d=MEDIUM; st=$(fw_port_status "${exp##*:}")
+    case "$st" in blocked|restricted) d=LOW ;; esac
+    finding "$d" DB-LISTEN-01 MariaDB "Database listen di interface jaringan" "listen:$exp; status host firewall untuk port ini: ${st:-tidak diketahui}" \
       "Wajar jika aplikasi di server lain: pastikan port DB hanya bisa diakses dari IP server aplikasi (firewalld + Palo Alto). Jika aplikasi lokal: bind-address=127.0.0.1."
   fi
 
@@ -2218,8 +2853,9 @@ check_postgres() {
 
   for addr in $(listen_of_pid "$pid"); do is_loopback "${addr%:*}" || exp="$exp $addr"; done
   if [ -n "$exp" ]; then
-    if [ "$FW_ON" -eq 1 ]; then d=LOW; else d=MEDIUM; fi
-    finding "$d" DB-LISTEN-01 PostgreSQL "Database listen di interface jaringan" "listen:$exp; host firewall aktif=$FW_ON" \
+    d=MEDIUM; st=$(fw_port_status "${exp##*:}")
+    case "$st" in blocked|restricted) d=LOW ;; esac
+    finding "$d" DB-LISTEN-01 PostgreSQL "Database listen di interface jaringan" "listen:$exp; status host firewall untuk port ini: ${st:-tidak diketahui}" \
       "Wajar jika aplikasi di server lain: batasi port hanya dari IP server aplikasi (firewalld + Palo Alto + pg_hba.conf). Jika lokal: listen_addresses='localhost'."
   fi
 
@@ -2302,11 +2938,16 @@ check_java_common() { # $1=pid $2=kategori $3=label
     "Aktifkan jmxremote.authenticate=true + SSL, atau bind JMX hanya ke localhost."
   echo "$cmd" | grep -qE 'jdwp|-Xdebug|-Xrunjdwp' && finding HIGH JAVA-DEBUG-01 "$cat" "Remote debug (JDWP) aktif di production (bisa RCE)" "$label (PID $pid)" \
     "Hapus opsi -agentlib:jdwp/-Xdebug dari startup production."
+  local fwok="" st
   for addr in $(listen_of_pid "$pid"); do
     is_loopback "${addr%:*}" && continue
     case "${addr##*:}" in 9990|9993|9999) continue ;; esac
+    st=$(fw_port_status "${addr##*:}")
+    case "$st" in blocked|restricted) fwok="$fwok $addr($st)"; continue ;; esac
     exp="$exp $addr"
   done
+  [ -n "$fwok" ] && [ -z "$exp" ] && finding INFO JAVA-PORT-02 "$cat" "Port aplikasi listen di jaringan, tetapi sudah dibatasi host firewall" "$label:$fwok" \
+    "Rincian sumber yang diizinkan di raw/firewall_analysis.txt."
   [ -n "$exp" ] && finding LOW JAVA-PORT-01 "$cat" "Port aplikasi bisa diakses langsung dari jaringan (bisa mem-bypass proxy)" "$label:$exp" \
     "Jika aplikasi diakses lewat reverse proxy, bind ke localhost/IP internal atau batasi port hanya dari IP proxy."
   [ "$cat" = SpringBoot ] || app_log_targets "$pid" "$label"
