@@ -1,4 +1,4 @@
-# Panduan: assess.sh v4.7 + Trivy di Kali
+# Panduan: assess.sh v4.8 + Trivy di Kali
 
 Alur: server (offline) → salin manual → Kali (ada internet) → unggah dua file hasil ke chat Claude.
 
@@ -141,6 +141,11 @@ Unggah dua file teks ini ke chat:
 
 ## Yang dikenali otomatis
 
+- **Firewall host (baru di v4.8):** dinilai dari aturan yang benar-benar berlaku di kernel, bukan sekadar status service. Mencakup `nft -j list ruleset` (firewalld, nftables manual, iptables-nft) dan `iptables-legacy`/`iptables` untuk CentOS 7, ditambah ufw. Setiap port yang listen diberi status DIBLOK / DIBATASI (IP sumber) / TERBUKA UNTUK SEMUA, ditulis di `raw/firewall_analysis.txt`.
+  - `HRD-FW-01` (MEDIUM): tidak ada aturan yang memfilter sama sekali.
+  - `HRD-FW-02` (MEDIUM): firewall aktif, tetapi ada port yang terbuka untuk semua IP.
+  - `HRD-FW-03` (LOW): aturan tidak persisten (service tidak enabled, atau runtime firewalld berbeda dari permanent).
+  - Temuan `JAVA-PORT-01` dan `DB-LISTEN-01` tidak dimunculkan atau diturunkan bila port-nya sudah dibatasi firewall.
 - **Web server (baru di v4.7):** semua file config Apache yang benar-benar dimuat, di folder sedalam apa pun (`httpd -t -D DUMP_INCLUDES`, dengan cadangan penelusuran `Include`/`IncludeOptional`). Termasuk beberapa instance httpd dengan `-f`/`-d` custom, ServerRoot di luar lokasi bawaan (mis. `/usr/local/apache2`), dan `.htaccess` di DocumentRoot. Nginx dibaca lewat `nginx -T`, termasuk instance dengan `-c` custom.
   - `raw/httpd_config_full.txt`: isi config lengkap dengan nomor baris dan komentar (secret disamarkan).
   - `raw/web_proxy_analysis.txt`: peta path depan → backend → status akses (PUBLIK/DIBATASI).
